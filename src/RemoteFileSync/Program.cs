@@ -23,8 +23,37 @@ public class Program
         using var logger = new SyncLogger(options.Verbose, options.LogFile);
         logger.Summary($"RemoteFileSync v1.0 — {(options.IsServer ? "Server" : "Client")} mode");
 
-        // TODO: Wire up server/client orchestration in a later task
-        return 0;
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            cts.Cancel();
+            logger.Warning("Cancellation requested...");
+        };
+
+        try
+        {
+            if (options.IsServer)
+            {
+                var server = new Network.SyncServer(options, logger);
+                return await server.RunAsync(cts.Token);
+            }
+            else
+            {
+                var client = new Network.SyncClient(options, logger);
+                return await client.RunAsync(cts.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            logger.Summary("Operation cancelled.");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            logger.Error($"Fatal error: {ex.Message}");
+            return 3;
+        }
     }
 
     public static SyncOptions ParseArgs(string[] args)
