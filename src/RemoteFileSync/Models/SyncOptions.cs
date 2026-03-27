@@ -7,6 +7,7 @@ public sealed class SyncOptions
     public int Port { get; set; } = 15782;
     public string Folder { get; set; } = string.Empty;
     public bool Bidirectional { get; set; }
+    public bool DeleteEnabled { get; set; }
     public string? BackupFolder { get; set; }
     public List<string> IncludePatterns { get; set; } = new();
     public List<string> ExcludePatterns { get; set; } = new();

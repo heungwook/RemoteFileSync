@@ -6,7 +6,9 @@ public enum SyncActionType : byte
     SendToClient = 1,
     ClientOnly = 2,
     ServerOnly = 3,
-    Skip = 4
+    Skip = 4,
+    DeleteOnServer = 5,
+    DeleteOnClient = 6
 }
 
 public sealed class SyncPlanEntry
