@@ -22,4 +22,19 @@ public static class ConflictResolver
 
         return SyncActionType.Skip;
     }
+
+    /// <summary>
+    /// Resolves the action when a file was deleted on one side and still exists on the other.
+    /// Case 1: Surviving file untouched (modTime ≤ lastSyncUtc + tolerance) → propagate deletion.
+    /// Case 2: Surviving file modified (modTime > lastSyncUtc + tolerance) → restore (copy to deleting side).
+    /// </summary>
+    public static SyncActionType ResolveDeleteConflict(bool deletedOnClient, FileEntry survivingEntry, DateTime lastSyncUtc)
+    {
+        bool untouched = survivingEntry.LastModifiedUtc <= lastSyncUtc + TimestampTolerance;
+
+        if (deletedOnClient)
+            return untouched ? SyncActionType.DeleteOnServer : SyncActionType.SendToClient;
+        else
+            return untouched ? SyncActionType.DeleteOnClient : SyncActionType.SendToServer;
+    }
 }
