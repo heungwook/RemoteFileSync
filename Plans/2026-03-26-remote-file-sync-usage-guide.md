@@ -24,6 +24,7 @@ RemoteFileSync.exe <server|client> [options]
 | `--port` | `-p` | `15782` | TCP port number |
 | `--folder` | `-f` | — | Local sync folder path (required) |
 | `--bidirectional` | `-b` | off | Enable bi-directional sync |
+| `--delete` | `-d` | off | Enable deletion propagation (opt-in) |
 | `--backup-folder` | — | same as `--folder` | Root folder for outdated file backups |
 | `--include` | — | all files | Glob include pattern (repeatable) |
 | `--exclude` | — | none | Glob exclude pattern (repeatable) |
@@ -286,6 +287,48 @@ RemoteFileSync.exe client \
 
 ---
 
+### 11. Deletion Propagation with `--delete`
+
+When `--delete` is enabled, files deleted on one side since the last sync are detected and handled:
+
+- **Case 1:** Deleted on Side-A, untouched on Side-B → delete propagated to Side-B (backed up first)
+- **Case 2:** Deleted on Side-A, modified on Side-B → restored from Side-B to Side-A
+
+The first sync with `--delete` establishes a state baseline (no deletions occur). Subsequent syncs compare against this baseline to detect deletions.
+
+**Bi-directional sync with deletion propagation:**
+```
+RemoteFileSync.exe server -f "D:\SharedFiles" -p 15782
+
+RemoteFileSync.exe client -h 192.168.1.100 -p 15782 -f "C:\SharedFiles" -b -d
+```
+
+**Uni-directional sync with deletion (client is source of truth):**
+```
+RemoteFileSync.exe server -f "D:\Mirror" -p 15782
+
+RemoteFileSync.exe client -h 192.168.1.100 -p 15782 -f "C:\Source" -d
+```
+
+In uni-directional mode, only client-side deletions propagate to the server. Server-side deletions are ignored (server is not authoritative).
+
+**State file location:**
+```
+%LOCALAPPDATA%\RemoteFileSync\{pairId}\sync-state.bin
+```
+
+State is saved only after a fully successful sync (exit code 0). If a sync is partial or fails, the state file is not updated.
+
+**Verbose output with deletions:**
+```
+[07:30:03] Sync plan: 6 transfers, 2 delete, 141 skipped
+[07:30:04] [DEL→] docs/old-report.docx (deleted on server)
+[07:30:04] [←] data/updated.csv (deleted on client, modified on server → restore)
+[07:30:05] Sync complete: 8 files transferred, 2 deleted, 45.2 MB total.
+```
+
+---
+
 ## How Conflict Resolution Works
 
 When the same file exists on both sides with different content:
@@ -336,3 +379,6 @@ All other file types (`.txt`, `.cs`, `.json`, `.xml`, `.csv`, `.html`, etc.) are
 | "Disk full" error | Free disk space on receiving side; check backup folder size |
 | Slow transfers | Increase `--block-size` and `--max-threads`; check network bandwidth |
 | Permission denied | Run as administrator or check folder permissions |
+| Deleted files reappearing | Enable `--delete` flag; without it, deleted files are copied back as "new" |
+| `--delete` not deleting on first run | Expected: the first sync with `--delete` only establishes state; deletions propagate from the second run onward |
+| Wrong files deleted | Check system clocks (NTP); large clock skew can cause false "modified" detection |

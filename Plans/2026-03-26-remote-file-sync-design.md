@@ -1,8 +1,8 @@
 # RemoteFileSync — Design Specification
 
 **Date:** 2026-03-26
-**Version:** 1.0
-**Status:** Draft
+**Version:** 1.1
+**Status:** Implemented
 **Platform:** Windows 10 / Windows 11
 **Runtime:** .NET 10, C#
 
@@ -48,7 +48,9 @@ RemoteFileSync/
 ├── Sync/
 │   ├── FileScanner.cs          # Scans directories, builds manifests
 │   ├── SyncEngine.cs           # Compares manifests, produces sync plan
-│   └── ConflictResolver.cs     # Timestamp/size comparison logic
+│   └── ConflictResolver.cs     # Timestamp/size comparison + deletion resolution
+├── State/
+│   └── SyncStateManager.cs     # Persistent sync state for deletion detection
 ├── Transfer/
 │   ├── FileTransfer.cs         # Sends/receives files over TCP
 │   └── CompressionHelper.cs    # GZip compression + compressed-format detection
@@ -148,6 +150,7 @@ RemoteFileSync.exe client --host 192.168.1.100 --port 15782 --folder "C:\SyncFol
 | `--port` | `-p` | No | `15782` | TCP port number |
 | `--folder` | `-f` | Yes | — | Local sync folder path |
 | `--bidirectional` | `-b` | No | `false` | Enable bi-directional sync |
+| `--delete` | `-d` | No | `false` | Enable deletion propagation (opt-in, see [Deletion Sync Spec](2026-03-28-deletion-sync-design.md)) |
 | `--backup-folder` | — | No | Same as `--folder` | Root folder for outdated file backups |
 | `--include` | — | No | `*` (all files) | Glob include pattern (repeatable) |
 | `--exclude` | — | No | None | Glob exclude pattern (repeatable) |
@@ -192,7 +195,7 @@ Every message uses a fixed header followed by variable-length payload:
 
 | Code | Name | Direction | Payload Format |
 |------|------|-----------|----------------|
-| `0x01` | `Handshake` | Client → Server | Version (`byte`) + SyncMode (`byte`: 0=uni, 1=bidi) |
+| `0x01` | `Handshake` | Client → Server | Version (`byte`) + SyncMode (`byte`: 0=uni, 1=bidi, 2=uni+delete, 3=bidi+delete) |
 | `0x02` | `HandshakeAck` | Server → Client | Version (`byte`) + Status (`byte`: 0=OK, 1=Reject) |
 | `0x03` | `Manifest` | Both | Serialized file manifest (see §4.4) |
 | `0x04` | `SyncPlan` | Client → Server | Serialized list of sync actions (see §4.5) |
@@ -200,7 +203,9 @@ Every message uses a fixed header followed by variable-length payload:
 | `0x06` | `FileChunk` | Sender → Receiver | FileId (`int16`) + ChunkIndex (`int32`) + ChunkData (`byte[]`) |
 | `0x07` | `FileEnd` | Sender → Receiver | FileId (`int16`) + SHA256 checksum (`32 bytes`) |
 | `0x08` | `BackupConfirm` | Receiver → Sender | RelativePath (`UTF-8`) + Success (`byte`) |
-| `0x09` | `SyncComplete` | Both | FilesTransferred (`int32`) + BytesTransferred (`int64`) + ElapsedMs (`int64`) |
+| `0x09` | `SyncComplete` | Both | FilesTransferred (`int32`) + BytesTransferred (`int64`) + FilesDeleted (`int32`) + ElapsedMs (`int64`) |
+| `0x0A` | `DeleteFile` | Plan executor → File owner | PathLength (`int16`) + RelativePath (`UTF-8`) + BackupFirst (`byte`) |
+| `0x0B` | `DeleteConfirm` | File owner → Plan executor | PathLength (`int16`) + RelativePath (`UTF-8`) + Success (`byte`) |
 | `0xFF` | `Error` | Both | ErrorCode (`int32`) + Message (`UTF-8`) |
 
 ### 4.4 Manifest Serialization (Binary)
@@ -227,7 +232,7 @@ Every message uses a fixed header followed by variable-length payload:
 │ ActionCount    │  int32
 ├────────────────┤
 │ Action[0]      │
-│  ActionType    │  byte (0=SendToServer, 1=SendToClient, 2=ClientOnly, 3=ServerOnly, 4=Skip)
+│  ActionType    │  byte (0=SendToServer, 1=SendToClient, 2=ClientOnly, 3=ServerOnly, 4=Skip, 5=DeleteOnServer, 6=DeleteOnClient)
 │  PathLength    │  int16
 │  RelativePath  │  UTF-8 bytes
 ├────────────────┤
@@ -239,25 +244,39 @@ Every message uses a fixed header followed by variable-length payload:
 ### 4.6 Protocol Flow
 
 ```
-CLIENT                                  SERVER
-  │                                       │
-  │─── 0x01 Handshake (v1, bidi) ───────>│
-  │<── 0x02 HandshakeAck (OK) ──────────│
-  │                                       │
-  │─── 0x03 Manifest (client files) ────>│
-  │<── 0x03 Manifest (server files) ─────│
-  │                                       │
-  │  [Client computes sync plan]          │
-  │─── 0x04 SyncPlan ──────────────────>│
-  │                                       │
-  │  [Transfer phase: both directions]    │
-  │─── 0x05/06/07 File ────────────────>│  (client → server)
-  │<── 0x08 BackupConfirm ──────────────│
-  │<── 0x05/06/07 File ─────────────────│  (server → client, if bidi)
-  │─── 0x08 BackupConfirm ────────────>│
-  │                                       │
-  │─── 0x09 SyncComplete ──────────────>│
-  │<── 0x09 SyncComplete ───────────────│
+CLIENT                                       SERVER
+  │                                            │
+  │─── 0x01 Handshake (v1, syncMode) ────────>│
+  │<── 0x02 HandshakeAck (OK) ────────────────│
+  │                                            │
+  │  [Client loads state file if --delete]     │
+  │                                            │
+  │─── 0x03 Manifest (client files) ─────────>│
+  │<── 0x03 Manifest (server files) ──────────│
+  │                                            │
+  │  [Client computes sync plan]               │
+  │─── 0x04 SyncPlan ────────────────────────>│
+  │                                            │
+  │  === File Transfer Phase ===               │
+  │─── 0x05/06/07 Files → Server ────────────>│
+  │<── 0x08 BackupConfirm ───────────────────│
+  │                                            │
+  │  === Deletion Phase (Server, if --delete) =│
+  │─── 0x0A DeleteFile ──────────────────────>│
+  │<── 0x0B DeleteConfirm ───────────────────│
+  │                                            │
+  │  === Bi-directional Transfer Phase ===     │
+  │<── 0x05/06/07 Files → Client ────────────│
+  │─── 0x08 BackupConfirm ──────────────────>│
+  │                                            │
+  │  === Deletion Phase (Client, if --delete) =│
+  │<── 0x0A DeleteFile ──────────────────────│
+  │─── 0x0B DeleteConfirm ──────────────────>│
+  │                                            │
+  │─── 0x09 SyncComplete ───────────────────>│
+  │<── 0x09 SyncComplete ──────────────────│
+  │                                            │
+  │  [Client saves state file if --delete]     │
 ```
 
 ### 4.7 Connection Lifecycle
@@ -284,6 +303,8 @@ CLIENT                                  SERVER
 | `ClientOnly` | File exists only on client → copy to server |
 | `ServerOnly` | File exists only on server → copy to client (bidi only) |
 | `Skip` | Files are identical — no action needed |
+| `DeleteOnServer` | File deleted on client, untouched on server → backup and delete on server (`--delete` only) |
+| `DeleteOnClient` | File deleted on server, untouched on client → backup and delete on client (`--delete` only) |
 
 ### 5.2 Comparison Algorithm
 
@@ -298,6 +319,12 @@ For each file matched by relative path:
 2. File exists on ONE side only:
    a. Uni-directional mode: only ClientOnly actions (client → server)
    b. Bi-directional mode: ClientOnly or ServerOnly (copy to missing side)
+
+3. File was in previous sync state but now missing (--delete mode only):
+   a. Deleted on Side-A, untouched on Side-B → propagate deletion to Side-B
+   b. Deleted on Side-A, modified on Side-B → restore (copy Side-B → Side-A)
+   c. Deleted on both sides → no action
+   See: 2026-03-28-deletion-sync-design.md for full specification
 ```
 
 **Timestamp tolerance:** ±2 seconds to account for FAT32/NTFS timestamp granularity differences and minor clock drift between machines.
@@ -509,6 +536,7 @@ dotnet publish -c Release -r win-arm64
 | Network protocol | Raw TCP sockets | Lightest weight, zero dependencies, full control |
 | Encryption | None | Designed for trusted LAN/VPN environments |
 | Conflict resolution | Newer timestamp wins; tie-break by larger size | Fully deterministic, no human intervention needed |
+| Deletion propagation | Opt-in `--delete` flag with client-side manifest snapshot | Safe by default; state at `%LOCALAPPDATA%\RemoteFileSync\` |
 | File filtering | `--include` / `--exclude` glob patterns | User-controlled, no hardcoded assumptions |
 | Logging | Quiet default, `--verbose`, `--log` | Clean for automation, detailed for troubleshooting |
 | Compression | GZip, skip already-compressed extensions | Built-in .NET, no dependencies |
@@ -523,6 +551,8 @@ dotnet publish -c Release -r win-arm64
 
 These are explicitly **not** part of the current design but noted for potential future work:
 
+- `--purge-state` flag to clean up orphaned state files
+- Dry-run mode for `--delete` (preview deletions without executing)
 - TLS encryption via `SslStream` for untrusted networks
 - Delta/differential sync (transfer only changed portions of files)
 - File watching mode for continuous real-time sync

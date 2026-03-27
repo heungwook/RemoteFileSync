@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-28
 **Version:** 1.1
-**Status:** Draft
+**Status:** Implemented
 **Parent Spec:** 2026-03-26-remote-file-sync-design.md
 **Branch:** feature/deletion-sync
 **Platform:** Windows 10 / Windows 11
@@ -294,10 +294,11 @@ CLIENT                                       SERVER
   │    [Client: backup → delete]               │
   │─── 0x0B DeleteConfirm ──────────────────>│
   │                                            │
-  │  [Client saves state file]                 │
-  │                                            │
   │─── 0x09 SyncComplete ───────────────────>│
   │<── 0x09 SyncComplete ──────────────────│
+  │                                            │
+  │  [Client saves state file AFTER           │
+  │   successful SyncComplete exchange]        │
 ```
 
 **Ordering guarantee:** File transfers complete before deletions execute. This ensures restored files (Case 2) arrive before any deletions run.
