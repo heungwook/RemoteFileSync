@@ -153,8 +153,13 @@ public class DeleteSyncTests : IDisposable
 
         Assert.Equal(0, clientResult);
         Assert.Equal(0, serverResult);
+        // Both files should be deleted from their respective sides
         Assert.False(File.Exists(Path.Combine(_serverDir, "client-deleted.txt")));
         Assert.False(File.Exists(Path.Combine(_clientDir, "server-deleted.txt")));
+        // Both files should be backed up before deletion
+        var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
+        Assert.True(File.Exists(Path.Combine(_serverDir, dateStr, "client-deleted.txt")));
+        Assert.True(File.Exists(Path.Combine(_clientDir, dateStr, "server-deleted.txt")));
     }
 
     [Fact]

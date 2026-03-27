@@ -231,16 +231,34 @@ public sealed class SyncClient
                 {
                     if (backupFirst)
                     {
-                        backup.BackupFile(path);
+                        if (backup.BackupFile(path))
+                        {
+                            success = true;
+                            filesDeleted++;
+                            _logger.Info($"[DEL] {path} (deleted locally)");
+                        }
+                        else
+                        {
+                            _logger.Warning($"File not found for backup/delete: {path}. Skipping.");
+                            skippedFiles++;
+                        }
                     }
                     else
                     {
                         var fullPath = Path.Combine(_options.Folder, path.Replace('/', Path.DirectorySeparatorChar));
-                        if (File.Exists(fullPath)) File.Delete(fullPath);
+                        if (File.Exists(fullPath))
+                        {
+                            File.Delete(fullPath);
+                            success = true;
+                            filesDeleted++;
+                            _logger.Info($"[DEL] {path} (deleted locally)");
+                        }
+                        else
+                        {
+                            _logger.Warning($"File not found for delete: {path}. Skipping.");
+                            skippedFiles++;
+                        }
                     }
-                    success = true;
-                    filesDeleted++;
-                    _logger.Info($"[DEL] {path} (deleted locally)");
                 }
                 catch (Exception ex)
                 {
@@ -253,8 +271,16 @@ public sealed class SyncClient
             }
         }
 
-        // 11. Save state (only on full success)
+        // 11. Exchange SyncComplete
+        sw.Stop();
         int exitCode = skippedFiles > 0 ? 1 : 0;
+        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, filesDeleted, sw.ElapsedMilliseconds);
+        await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
+        var (scType, scData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+        var deletedLabel = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
+        _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedLabel}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
+
+        // 12. Save state AFTER successful SyncComplete exchange (exit code 0 only)
         if (exitCode == 0 && _options.DeleteEnabled && _stateManager != null)
         {
             var mergedManifest = SyncEngine.BuildMergedManifest(clientManifest, serverManifest, syncPlan);
@@ -262,13 +288,6 @@ public sealed class SyncClient
             _logger.Debug($"Sync state saved: {mergedManifest.Count} files");
         }
 
-        // 12. Exchange SyncComplete
-        sw.Stop();
-        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, filesDeleted, sw.ElapsedMilliseconds);
-        await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
-        var (scType, scData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
-        var deletedLabel = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
-        _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedLabel}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
         return exitCode;
     }
 }

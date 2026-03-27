@@ -138,16 +138,34 @@ public sealed class SyncServer
                 {
                     if (backupFirst)
                     {
-                        backup.BackupFile(path); // Moves file to backup = effectively deleted
+                        if (backup.BackupFile(path))
+                        {
+                            success = true;
+                            filesDeleted++;
+                            _logger.Info($"[DEL] {path}");
+                        }
+                        else
+                        {
+                            _logger.Warning($"File not found for backup/delete: {path}. Skipping.");
+                            skippedFiles++;
+                        }
                     }
                     else
                     {
                         var fullPath = Path.Combine(_options.Folder, path.Replace('/', Path.DirectorySeparatorChar));
-                        if (File.Exists(fullPath)) File.Delete(fullPath);
+                        if (File.Exists(fullPath))
+                        {
+                            File.Delete(fullPath);
+                            success = true;
+                            filesDeleted++;
+                            _logger.Info($"[DEL] {path}");
+                        }
+                        else
+                        {
+                            _logger.Warning($"File not found for delete: {path}. Skipping.");
+                            skippedFiles++;
+                        }
                     }
-                    success = true;
-                    filesDeleted++;
-                    _logger.Info($"[DEL] {path}");
                 }
                 catch (Exception ex)
                 {

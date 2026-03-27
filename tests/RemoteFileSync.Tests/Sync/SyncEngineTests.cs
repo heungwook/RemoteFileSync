@@ -204,6 +204,33 @@ public class SyncEngineTests
     }
 
     [Fact]
+    public void TimestampTolerance_WithinTwoSeconds_TreatedAsUntouched()
+    {
+        // File mod time is 1 second after lastSync — within ±2s tolerance → treat as untouched → delete
+        var withinTolerance = LastSync.AddSeconds(1);
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = new FileManifest(); // deleted on client
+        var server = MakeManifest(new FileEntry("file.txt", 100, withinTolerance));
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
+    }
+
+    [Fact]
+    public void UniDirectional_ServerDeletionsIgnored()
+    {
+        // In uni-directional mode, server deletions must not propagate to the client
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = MakeManifest(new FileEntry("file.txt", 100, BeforeSync)); // untouched
+        var server = new FileManifest(); // deleted on server
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: false, previousState: state, deleteEnabled: true);
+        // Server deletion ignored in uni mode — no DeleteOnClient, no action at all
+        Assert.Empty(plan);
+    }
+
+    [Fact]
     public void DeleteEnabled_False_IgnoresDeletions()
     {
         var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
