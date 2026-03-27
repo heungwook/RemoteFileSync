@@ -77,4 +77,28 @@ public class CliParserTests
         Assert.True(result.IsServer);
         Assert.Equal("ignored", result.Host);
     }
+
+    [Fact]
+    public void ParseArgs_DeleteLongFlag_SetsDeleteEnabled()
+    {
+        var args = new[] { "client", "--host", "localhost", "--folder", @"C:\Sync", "--delete" };
+        var opts = Program.ParseArgs(args);
+        Assert.True(opts.DeleteEnabled);
+    }
+
+    [Fact]
+    public void ParseArgs_DeleteShortFlag_SetsDeleteEnabled()
+    {
+        var args = new[] { "client", "--host", "localhost", "--folder", @"C:\Sync", "-d" };
+        var opts = Program.ParseArgs(args);
+        Assert.True(opts.DeleteEnabled);
+    }
+
+    [Fact]
+    public void ParseArgs_NoDeleteFlag_DefaultsFalse()
+    {
+        var args = new[] { "client", "--host", "localhost", "--folder", @"C:\Sync" };
+        var opts = Program.ParseArgs(args);
+        Assert.False(opts.DeleteEnabled);
+    }
 }

@@ -1,5 +1,6 @@
 using RemoteFileSync.Models;
 using RemoteFileSync.Logging;
+using RemoteFileSync.State;
 
 namespace RemoteFileSync;
 
@@ -40,7 +41,10 @@ public class Program
             }
             else
             {
-                var client = new Network.SyncClient(options, logger);
+                SyncStateManager? stateManager = null;
+                if (options.DeleteEnabled)
+                    stateManager = new SyncStateManager(SyncStateManager.DefaultBaseDir);
+                var client = new Network.SyncClient(options, logger, stateManager);
                 return await client.RunAsync(cts.Token);
             }
         }
@@ -105,6 +109,9 @@ public class Program
                 case "--log" or "-l":
                     options.LogFile = args[++i];
                     break;
+                case "--delete" or "-d":
+                    options.DeleteEnabled = true;
+                    break;
                 default:
                     throw new ArgumentException($"Unknown option: {arg}");
             }
@@ -123,6 +130,7 @@ public class Program
         Console.Error.WriteLine("  --port, -p <port>       TCP port (default: 15782)");
         Console.Error.WriteLine("  --folder, -f <path>     Local sync folder (required)");
         Console.Error.WriteLine("  --bidirectional, -b     Enable bi-directional sync");
+        Console.Error.WriteLine("  --delete, -d            Enable deletion propagation (opt-in)");
         Console.Error.WriteLine("  --backup-folder <path>  Backup folder (default: sync folder)");
         Console.Error.WriteLine("  --include <pattern>     Glob include pattern (repeatable)");
         Console.Error.WriteLine("  --exclude <pattern>     Glob exclude pattern (repeatable)");
