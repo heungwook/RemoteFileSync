@@ -11,5 +11,7 @@ public enum MessageType : byte
     FileEnd = 0x07,
     BackupConfirm = 0x08,
     SyncComplete = 0x09,
+    DeleteFile = 0x0A,
+    DeleteConfirm = 0x0B,
     Error = 0xFF
 }

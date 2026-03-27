@@ -37,11 +37,11 @@ public static class ProtocolHandler
         }
     }
 
-    public static byte[] SerializeHandshake(byte version, bool bidirectional) =>
-        new[] { version, (byte)(bidirectional ? 1 : 0) };
+    public static byte[] SerializeHandshake(byte version, byte syncMode) =>
+        new[] { version, syncMode };
 
-    public static (byte version, bool bidirectional) DeserializeHandshake(byte[] data) =>
-        (data[0], data[1] == 1);
+    public static (byte version, byte syncMode) DeserializeHandshake(byte[] data) =>
+        (data[0], data[1]);
 
     public static byte[] SerializeHandshakeAck(byte version, bool accepted) =>
         new[] { version, (byte)(accepted ? 0 : 1) };
@@ -177,17 +177,18 @@ public static class ProtocolHandler
         return (fileId, hash);
     }
 
-    public static byte[] SerializeSyncComplete(int filesTransferred, long bytesTransferred, long elapsedMs)
+    public static byte[] SerializeSyncComplete(int filesTransferred, long bytesTransferred, int filesDeleted, long elapsedMs)
     {
-        var result = new byte[20];
+        var result = new byte[24];
         BitConverter.TryWriteBytes(result.AsSpan(0), filesTransferred);
         BitConverter.TryWriteBytes(result.AsSpan(4), bytesTransferred);
-        BitConverter.TryWriteBytes(result.AsSpan(12), elapsedMs);
+        BitConverter.TryWriteBytes(result.AsSpan(12), filesDeleted);
+        BitConverter.TryWriteBytes(result.AsSpan(16), elapsedMs);
         return result;
     }
 
-    public static (int filesTransferred, long bytesTransferred, long elapsedMs) DeserializeSyncComplete(byte[] data) =>
-        (BitConverter.ToInt32(data, 0), BitConverter.ToInt64(data, 4), BitConverter.ToInt64(data, 12));
+    public static (int filesTransferred, long bytesTransferred, int filesDeleted, long elapsedMs) DeserializeSyncComplete(byte[] data) =>
+        (BitConverter.ToInt32(data, 0), BitConverter.ToInt64(data, 4), BitConverter.ToInt32(data, 12), BitConverter.ToInt64(data, 16));
 
     public static byte[] SerializeError(int errorCode, string message)
     {
@@ -200,4 +201,48 @@ public static class ProtocolHandler
 
     public static (int errorCode, string message) DeserializeError(byte[] data) =>
         (BitConverter.ToInt32(data, 0), Encoding.UTF8.GetString(data, 4, data.Length - 4));
+
+    public static byte[] SerializeDeleteFile(string relativePath, bool backupFirst)
+    {
+        var pathBytes = Encoding.UTF8.GetBytes(relativePath);
+        using var ms = new MemoryStream();
+        using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+        writer.Write((short)pathBytes.Length);
+        writer.Write(pathBytes);
+        writer.Write((byte)(backupFirst ? 1 : 0));
+        writer.Flush();
+        return ms.ToArray();
+    }
+
+    public static (string relativePath, bool backupFirst) DeserializeDeleteFile(byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var reader = new BinaryReader(ms, Encoding.UTF8);
+        short pathLen = reader.ReadInt16();
+        var path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+        bool backupFirst = reader.ReadByte() == 1;
+        return (path, backupFirst);
+    }
+
+    public static byte[] SerializeDeleteConfirm(string relativePath, bool success)
+    {
+        var pathBytes = Encoding.UTF8.GetBytes(relativePath);
+        using var ms = new MemoryStream();
+        using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+        writer.Write((short)pathBytes.Length);
+        writer.Write(pathBytes);
+        writer.Write((byte)(success ? 1 : 0));
+        writer.Flush();
+        return ms.ToArray();
+    }
+
+    public static (string relativePath, bool success) DeserializeDeleteConfirm(byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var reader = new BinaryReader(ms, Encoding.UTF8);
+        short pathLen = reader.ReadInt16();
+        var path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+        bool success = reader.ReadByte() == 1;
+        return (path, success);
+    }
 }

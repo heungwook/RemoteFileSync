@@ -57,7 +57,8 @@ public sealed class SyncClient
         int skippedFiles = 0;
 
         // 1. Send handshake
-        var hsPayload = ProtocolHandler.SerializeHandshake(1, _options.Bidirectional);
+        byte syncMode = (byte)((_options.Bidirectional ? 1 : 0) | (_options.DeleteEnabled ? 2 : 0));
+        var hsPayload = ProtocolHandler.SerializeHandshake(1, syncMode);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.Handshake, hsPayload, ct);
 
         // 2. Receive HandshakeAck
@@ -162,7 +163,7 @@ public sealed class SyncClient
 
         // 8. Exchange SyncComplete
         sw.Stop();
-        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, sw.ElapsedMilliseconds);
+        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, 0, sw.ElapsedMilliseconds);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
         var (scType, scData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         _logger.Summary($"Sync complete: {filesTransferred} files, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");

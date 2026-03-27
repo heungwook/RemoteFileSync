@@ -54,7 +54,7 @@ public class ProtocolHandlerTests
     [Fact]
     public void SerializeHandshake_CorrectBytes()
     {
-        var bytes = ProtocolHandler.SerializeHandshake(version: 1, bidirectional: true);
+        var bytes = ProtocolHandler.SerializeHandshake(version: 1, syncMode: 1);
         Assert.Equal(2, bytes.Length);
         Assert.Equal(1, bytes[0]);
         Assert.Equal(1, bytes[1]);
@@ -64,9 +64,83 @@ public class ProtocolHandlerTests
     public void DeserializeHandshake_ParsesCorrectly()
     {
         var bytes = new byte[] { 1, 0 };
-        var (version, bidi) = ProtocolHandler.DeserializeHandshake(bytes);
+        var (version, syncMode) = ProtocolHandler.DeserializeHandshake(bytes);
         Assert.Equal(1, version);
-        Assert.False(bidi);
+        Assert.Equal(0, syncMode);
+    }
+
+    [Fact]
+    public void Handshake_SyncMode_RoundTrips()
+    {
+        var data = ProtocolHandler.SerializeHandshake(1, 3);
+        var (version, syncMode) = ProtocolHandler.DeserializeHandshake(data);
+        Assert.Equal(1, version);
+        Assert.Equal(3, syncMode);
+    }
+
+    [Fact]
+    public void DeleteFile_SerializeDeserialize_RoundTrips()
+    {
+        var data = ProtocolHandler.SerializeDeleteFile("docs/old-report.docx", backupFirst: true);
+        var (path, backupFirst) = ProtocolHandler.DeserializeDeleteFile(data);
+        Assert.Equal("docs/old-report.docx", path);
+        Assert.True(backupFirst);
+    }
+
+    [Fact]
+    public void DeleteFile_NoBackup_RoundTrips()
+    {
+        var data = ProtocolHandler.SerializeDeleteFile("temp/cache.bin", backupFirst: false);
+        var (path, backupFirst) = ProtocolHandler.DeserializeDeleteFile(data);
+        Assert.Equal("temp/cache.bin", path);
+        Assert.False(backupFirst);
+    }
+
+    [Fact]
+    public void DeleteConfirm_Success_RoundTrips()
+    {
+        var data = ProtocolHandler.SerializeDeleteConfirm("docs/old-report.docx", success: true);
+        var (path, success) = ProtocolHandler.DeserializeDeleteConfirm(data);
+        Assert.Equal("docs/old-report.docx", path);
+        Assert.True(success);
+    }
+
+    [Fact]
+    public void DeleteConfirm_Failure_RoundTrips()
+    {
+        var data = ProtocolHandler.SerializeDeleteConfirm("locked/file.txt", success: false);
+        var (path, success) = ProtocolHandler.DeserializeDeleteConfirm(data);
+        Assert.Equal("locked/file.txt", path);
+        Assert.False(success);
+    }
+
+    [Fact]
+    public void SyncPlan_WithDeleteActions_RoundTrips()
+    {
+        var plan = new List<SyncPlanEntry>
+        {
+            new(SyncActionType.SendToServer, "update.txt"),
+            new(SyncActionType.DeleteOnServer, "old.txt"),
+            new(SyncActionType.DeleteOnClient, "removed.txt"),
+            new(SyncActionType.Skip, "same.txt")
+        };
+        var data = ProtocolHandler.SerializeSyncPlan(plan);
+        var result = ProtocolHandler.DeserializeSyncPlan(data);
+        Assert.Equal(4, result.Count);
+        Assert.Equal(SyncActionType.DeleteOnServer, result[1].Action);
+        Assert.Equal("old.txt", result[1].RelativePath);
+        Assert.Equal(SyncActionType.DeleteOnClient, result[2].Action);
+    }
+
+    [Fact]
+    public void SyncComplete_WithFilesDeleted_RoundTrips()
+    {
+        var data = ProtocolHandler.SerializeSyncComplete(10, 1024000, 3, 5000);
+        var (transferred, bytes, deleted, elapsed) = ProtocolHandler.DeserializeSyncComplete(data);
+        Assert.Equal(10, transferred);
+        Assert.Equal(1024000, bytes);
+        Assert.Equal(3, deleted);
+        Assert.Equal(5000, elapsed);
     }
 
     [Fact]

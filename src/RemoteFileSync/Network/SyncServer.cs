@@ -51,7 +51,8 @@ public sealed class SyncServer
             _logger.Error($"Expected Handshake, got {hsType}");
             return 3;
         }
-        var (version, bidirectional) = ProtocolHandler.DeserializeHandshake(hsData);
+        var (version, syncMode) = ProtocolHandler.DeserializeHandshake(hsData);
+        bool bidirectional = (syncMode & 1) != 0;
         _logger.Info($"Handshake: v{version}, {(bidirectional ? "bidirectional" : "unidirectional")}");
 
         // 2. Send HandshakeAck
@@ -143,7 +144,7 @@ public sealed class SyncServer
 
         // 8. Exchange SyncComplete
         sw.Stop();
-        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, sw.ElapsedMilliseconds);
+        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, 0, sw.ElapsedMilliseconds);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
         var (scType, scData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         _logger.Summary($"Sync complete: {filesTransferred} files, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
