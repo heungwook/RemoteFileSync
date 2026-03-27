@@ -53,6 +53,7 @@ public sealed class SyncServer
         }
         var (version, syncMode) = ProtocolHandler.DeserializeHandshake(hsData);
         bool bidirectional = (syncMode & 1) != 0;
+        bool deleteEnabled = (syncMode & 2) != 0;
         _logger.Info($"Handshake: v{version}, {(bidirectional ? "bidirectional" : "unidirectional")}");
 
         // 2. Send HandshakeAck
@@ -81,6 +82,7 @@ public sealed class SyncServer
         var sender = new FileTransferSender(_options.Folder, _options.BlockSize);
         int filesTransferred = 0;
         long bytesTransferred = 0;
+        int filesDeleted = 0;
 
         // 6. Receive files from client (SendToServer + ClientOnly)
         var toReceive = syncPlan.Where(p =>
@@ -116,7 +118,49 @@ public sealed class SyncServer
             await ProtocolHandler.WriteMessageAsync(stream, MessageType.BackupConfirm, confirm, ct);
         }
 
-        // 7. Send files to client (SendToClient + ServerOnly) if bidirectional
+        // 7. Deletion Phase (Server): Receive DeleteFile from client for DeleteOnServer actions
+        if (deleteEnabled)
+        {
+            var serverDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnServer).ToList();
+            foreach (var del in serverDeletes)
+            {
+                var (delType, delData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+                if (delType != MessageType.DeleteFile)
+                {
+                    _logger.Warning($"Expected DeleteFile, got {delType}");
+                    skippedFiles++;
+                    continue;
+                }
+
+                var (path, backupFirst) = ProtocolHandler.DeserializeDeleteFile(delData);
+                bool success = false;
+                try
+                {
+                    if (backupFirst)
+                    {
+                        backup.BackupFile(path); // Moves file to backup = effectively deleted
+                    }
+                    else
+                    {
+                        var fullPath = Path.Combine(_options.Folder, path.Replace('/', Path.DirectorySeparatorChar));
+                        if (File.Exists(fullPath)) File.Delete(fullPath);
+                    }
+                    success = true;
+                    filesDeleted++;
+                    _logger.Info($"[DEL] {path}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning($"Failed to delete {path}: {ex.Message}");
+                    skippedFiles++;
+                }
+
+                var confirmPayload = ProtocolHandler.SerializeDeleteConfirm(path, success);
+                await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteConfirm, confirmPayload, ct);
+            }
+        }
+
+        // 8. Send files to client (SendToClient + ServerOnly) if bidirectional
         if (bidirectional)
         {
             var toSend = syncPlan.Where(p =>
@@ -142,12 +186,40 @@ public sealed class SyncServer
             }
         }
 
-        // 8. Exchange SyncComplete
+        // 9. Deletion Phase (Client): Send DeleteFile for DeleteOnClient actions
+        if (deleteEnabled && bidirectional)
+        {
+            var clientDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnClient).ToList();
+            foreach (var del in clientDeletes)
+            {
+                var payload = ProtocolHandler.SerializeDeleteFile(del.RelativePath, backupFirst: true);
+                await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteFile, payload, ct);
+
+                var (confType, confData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+                if (confType == MessageType.DeleteConfirm)
+                {
+                    var (_, success) = ProtocolHandler.DeserializeDeleteConfirm(confData);
+                    if (success)
+                    {
+                        filesDeleted++;
+                        _logger.Info($"[DEL→] Client deleted {del.RelativePath}");
+                    }
+                    else
+                    {
+                        _logger.Warning($"Client failed to delete {del.RelativePath}");
+                        skippedFiles++;
+                    }
+                }
+            }
+        }
+
+        // 10. Exchange SyncComplete
         sw.Stop();
-        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, 0, sw.ElapsedMilliseconds);
+        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, filesDeleted, sw.ElapsedMilliseconds);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
         var (scType, scData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
-        _logger.Summary($"Sync complete: {filesTransferred} files, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
+        var deletedSummary = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
+        _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedSummary}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
         return skippedFiles > 0 ? 1 : 0;
     }
 }
