@@ -8,6 +8,10 @@ public class SyncEngineTests
     private static readonly DateTime T1 = new(2026, 3, 26, 10, 0, 0, DateTimeKind.Utc);
     private static readonly DateTime T2 = new(2026, 3, 26, 12, 0, 0, DateTimeKind.Utc);
 
+    private static readonly DateTime LastSync = new(2026, 3, 26, 12, 0, 0, DateTimeKind.Utc);
+    private static readonly DateTime BeforeSync = new(2026, 3, 26, 10, 0, 0, DateTimeKind.Utc);
+    private static readonly DateTime AfterSync = new(2026, 3, 27, 8, 0, 0, DateTimeKind.Utc);
+
     private static FileManifest MakeManifest(params FileEntry[] entries)
     {
         var m = new FileManifest();
@@ -97,5 +101,117 @@ public class SyncEngineTests
         Assert.Equal(SyncActionType.SendToServer, actions["client-newer.txt"]);
         Assert.Equal(SyncActionType.ClientOnly, actions["client-only.txt"]);
         Assert.Equal(SyncActionType.ServerOnly, actions["server-only.txt"]);
+    }
+
+    [Fact]
+    public void DeletedOnClient_UntouchedOnServer_ProducesDeleteOnServer()
+    {
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
+        Assert.Equal("file.txt", plan[0].RelativePath);
+    }
+
+    [Fact]
+    public void DeletedOnClient_ModifiedOnServer_ProducesSendToClient()
+    {
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("file.txt", 200, AfterSync));
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.SendToClient, plan[0].Action);
+    }
+
+    [Fact]
+    public void DeletedOnServer_UntouchedOnClient_ProducesDeleteOnClient()
+    {
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var server = new FileManifest();
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.DeleteOnClient, plan[0].Action);
+    }
+
+    [Fact]
+    public void DeletedOnServer_ModifiedOnClient_ProducesSendToServer()
+    {
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = MakeManifest(new FileEntry("file.txt", 200, AfterSync));
+        var server = new FileManifest();
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.SendToServer, plan[0].Action);
+    }
+
+    [Fact]
+    public void BothDeleted_NoAction()
+    {
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = new FileManifest();
+        var server = new FileManifest();
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
+        Assert.Empty(plan);
+    }
+
+    [Fact]
+    public void NoState_FullyAdditive()
+    {
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: null, deleteEnabled: true);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
+    }
+
+    [Fact]
+    public void UniDirectional_OnlyClientDeletionsPropagate()
+    {
+        var snapshot = MakeManifest(
+            new FileEntry("client-deleted.txt", 100, BeforeSync),
+            new FileEntry("server-deleted.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = MakeManifest(new FileEntry("server-deleted.txt", 100, BeforeSync));
+        var server = MakeManifest(new FileEntry("client-deleted.txt", 100, BeforeSync));
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: false, previousState: state, deleteEnabled: true);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
+        Assert.Equal("client-deleted.txt", plan[0].RelativePath);
+    }
+
+    [Fact]
+    public void NewFileNotInSnapshot_NormalCopyBehavior()
+    {
+        var snapshot = MakeManifest(new FileEntry("existing.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = MakeManifest(
+            new FileEntry("existing.txt", 100, BeforeSync),
+            new FileEntry("brand-new.txt", 50, AfterSync));
+        var server = MakeManifest(new FileEntry("existing.txt", 100, BeforeSync));
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
+        var actions = plan.ToDictionary(p => p.RelativePath, p => p.Action);
+        Assert.Equal(SyncActionType.Skip, actions["existing.txt"]);
+        Assert.Equal(SyncActionType.ClientOnly, actions["brand-new.txt"]);
+    }
+
+    [Fact]
+    public void DeleteEnabled_False_IgnoresDeletions()
+    {
+        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: false);
+        Assert.Single(plan);
+        Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
     }
 }
