@@ -460,7 +460,8 @@ LIMIT $limit;";
         }
         catch
         {
-            // Migration failed — start fresh
+            // Migration failed — delete partial db so next run starts fresh
+            try { if (File.Exists(dbPath)) File.Delete(dbPath); } catch { }
         }
     }
 
