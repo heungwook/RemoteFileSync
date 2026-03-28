@@ -17,17 +17,20 @@ public sealed class SyncClient
     private readonly SyncStateManager? _stateManager;
     private readonly JsonProgressWriter _progress;
     private readonly StdinCommandReader _stdinReader;
+    private readonly SyncDatabase? _db;
 
     public SyncClient(SyncOptions options, SyncLogger logger,
                       SyncStateManager? stateManager = null,
                       JsonProgressWriter? progressWriter = null,
-                      StdinCommandReader? stdinReader = null)
+                      StdinCommandReader? stdinReader = null,
+                      SyncDatabase? db = null)
     {
         _options = options;
         _logger = logger;
         _stateManager = stateManager;
         _progress = progressWriter ?? JsonProgressWriter.Null;
         _stdinReader = stdinReader ?? StdinCommandReader.Null;
+        _db = db;
     }
 
     public async Task<int> RunAsync(CancellationToken ct)
@@ -90,6 +93,15 @@ public sealed class SyncClient
             return 2;
         }
 
+        // Start database session
+        long sessionId = 0;
+        if (_options.DeleteEnabled && _db != null)
+        {
+            var mode = $"{(_options.Bidirectional ? "bidi" : "uni")}+delete";
+            sessionId = _db.StartSession(mode, _options.Folder, _options.Host!, _options.Port);
+            _logger.Info($"Sync session started (id={sessionId})");
+        }
+
         // 3. Load previous state (if delete enabled)
         SyncState? previousState = null;
         if (_options.DeleteEnabled && _stateManager != null)
@@ -116,9 +128,9 @@ public sealed class SyncClient
         _progress.WriteManifest("remote", serverManifest.Count, serverManifest.Entries.Sum(e => e.FileSize));
 
         // 6. Compute sync plan and send
-        var syncPlan = SyncEngine.ComputePlan(
-            clientManifest, serverManifest, _options.Bidirectional,
-            previousState, _options.DeleteEnabled);
+        var syncPlan = (_db != null)
+            ? SyncEngine.ComputePlan(clientManifest, serverManifest, _options.Bidirectional, _db, _options.DeleteEnabled)
+            : SyncEngine.ComputePlan(clientManifest, serverManifest, _options.Bidirectional, previousState, _options.DeleteEnabled);
         var transferCount = syncPlan.Count(p => p.Action != SyncActionType.Skip
             && p.Action != SyncActionType.DeleteOnServer && p.Action != SyncActionType.DeleteOnClient);
         var deleteCount = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer || p.Action == SyncActionType.DeleteOnClient);
@@ -128,6 +140,12 @@ public sealed class SyncClient
         _progress.WritePlan(transferCount, deleteCount, skipCount);
         var planBytes = ProtocolHandler.SerializeSyncPlan(syncPlan);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncPlan, planBytes, ct);
+
+        if (_db != null)
+        {
+            foreach (var skip in syncPlan.Where(p => p.Action == SyncActionType.Skip))
+                _db.MarkSkipped(skip.RelativePath, sessionId);
+        }
 
         var backup = new BackupManager(_options.Folder, _options.EffectiveBackupFolder);
         var sender = new FileTransferSender(_options.Folder, _options.BlockSize);
@@ -156,6 +174,11 @@ public sealed class SyncClient
                 if (cType != MessageType.BackupConfirm)
                     _logger.Warning($"Expected BackupConfirm, got {cType}");
                 _progress.WriteFileEnd(action.RelativePath, success: true, thread: 0);
+                if (_db != null)
+                {
+                    var sfi = new FileInfo(Path.Combine(_options.Folder, action.RelativePath.Replace('/', Path.DirectorySeparatorChar)));
+                    _db.MarkSynced(action.RelativePath, sfi.Length, sfi.LastWriteTimeUtc, sessionId, "to_server");
+                }
             }
             catch (Exception ex)
             {
@@ -184,6 +207,7 @@ public sealed class SyncClient
                     {
                         filesDeleted++;
                         _logger.Info($"[DEL→] {del.RelativePath} (deleted on server)");
+                        _db?.MarkDeleted(del.RelativePath, sessionId, "deleted on client, propagated to server");
                     }
                     else
                     {
@@ -217,6 +241,11 @@ public sealed class SyncClient
                     filesTransferred++;
                     var fi = new FileInfo(Path.Combine(_options.Folder, result.RelativePath.Replace('/', Path.DirectorySeparatorChar)));
                     bytesTransferred += fi.Length;
+                    if (_db != null)
+                    {
+                        var rfi = new FileInfo(Path.Combine(_options.Folder, result.RelativePath.Replace('/', Path.DirectorySeparatorChar)));
+                        _db.MarkSynced(result.RelativePath, rfi.Length, rfi.LastWriteTimeUtc, sessionId, "to_client");
+                    }
                 }
                 else
                 {
@@ -259,6 +288,7 @@ public sealed class SyncClient
                             success = true;
                             filesDeleted++;
                             _logger.Info($"[DEL] {path} (deleted locally)");
+                            _db?.MarkDeleted(path, sessionId, "deleted on server, propagated to client");
                         }
                         else
                         {
@@ -275,6 +305,7 @@ public sealed class SyncClient
                             success = true;
                             filesDeleted++;
                             _logger.Info($"[DEL] {path} (deleted locally)");
+                            _db?.MarkDeleted(path, sessionId, "deleted on server, propagated to client");
                         }
                         else
                         {
@@ -304,8 +335,16 @@ public sealed class SyncClient
         var deletedLabel = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
         _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedLabel}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
 
-        // 12. Save state AFTER successful SyncComplete exchange (exit code 0 only)
-        if (exitCode == 0 && _options.DeleteEnabled && _stateManager != null)
+        // 12. Complete database session (always, regardless of exit code)
+        if (_db != null && sessionId > 0)
+        {
+            _db.CompleteSession(sessionId, filesTransferred, filesDeleted,
+                syncPlan.Count(p => p.Action == SyncActionType.Skip), exitCode);
+            _logger.Debug($"Sync session {sessionId} completed (exit code {exitCode})");
+        }
+
+        // Fallback: save binary state when db is null (backward compat)
+        if (_db == null && exitCode == 0 && _options.DeleteEnabled && _stateManager != null)
         {
             var mergedManifest = SyncEngine.BuildMergedManifest(clientManifest, serverManifest, syncPlan);
             _stateManager.SaveState(_options.Folder, _options.Host!, _options.Port, mergedManifest, DateTime.UtcNow);

@@ -52,11 +52,28 @@ public class Program
             }
             else
             {
-                SyncStateManager? stateManager = null;
+                SyncDatabase? db = null;
                 if (options.DeleteEnabled)
-                    stateManager = new SyncStateManager(SyncStateManager.DefaultBaseDir);
-                var client = new Network.SyncClient(options, logger, stateManager, progressWriter, stdinReader);
-                return await client.RunAsync(cts.Token);
+                {
+                    var dbPath = SyncDatabase.GetDbPath(SyncDatabase.DefaultBaseDir, options.Folder, options.Host!, options.Port);
+
+                    // Auto-migrate from old binary state if needed
+                    var binPath = Path.Combine(Path.GetDirectoryName(dbPath)!, "sync-state.bin");
+                    SyncDatabase.MigrateFromBinary(binPath, dbPath);
+
+                    db = new SyncDatabase(dbPath);
+                }
+
+                try
+                {
+                    var client = new Network.SyncClient(options, logger, db: db,
+                        progressWriter: progressWriter, stdinReader: stdinReader);
+                    return await client.RunAsync(cts.Token);
+                }
+                finally
+                {
+                    db?.Dispose();
+                }
             }
         }
         catch (OperationCanceledException)
