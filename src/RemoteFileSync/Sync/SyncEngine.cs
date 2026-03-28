@@ -97,16 +97,17 @@ public static class SyncEngine
         bool deleteEnabled)
     {
         var plan = new List<SyncPlanEntry>();
-        var deletionHandled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Collect all paths: both manifests + DB tracked files with status='exists'
         var allPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var path in clientManifest.AllPaths) allPaths.Add(path);
         foreach (var path in serverManifest.AllPaths) allPaths.Add(path);
+        var dbIndex = new Dictionary<string, FileState>(StringComparer.OrdinalIgnoreCase);
         if (deleteEnabled && db != null)
         {
             foreach (var fs in db.GetAllTrackedFiles())
             {
+                dbIndex[fs.Path] = fs;
                 if (fs.Status == "exists")
                     allPaths.Add(fs.Path);
             }
@@ -128,7 +129,7 @@ public static class SyncEngine
                 // Client has, server doesn't
                 if (deleteEnabled && db != null)
                 {
-                    var dbState = db.GetFileState(path);
+                    var dbState = dbIndex.GetValueOrDefault(path);
                     if (dbState == null)
                     {
                         // Genuinely new — ClientOnly
@@ -160,14 +161,13 @@ public static class SyncEngine
                     // No DB — ClientOnly
                     plan.Add(new SyncPlanEntry(SyncActionType.ClientOnly, path));
                 }
-                deletionHandled.Add(path);
             }
             else if (clientEntry == null && serverEntry != null)
             {
                 // Server has, client doesn't
                 if (deleteEnabled && db != null)
                 {
-                    var dbState = db.GetFileState(path);
+                    var dbState = dbIndex.GetValueOrDefault(path);
                     if (dbState == null)
                     {
                         // Genuinely new on server — ServerOnly if bidi
@@ -194,12 +194,10 @@ public static class SyncEngine
                     if (bidirectional)
                         plan.Add(new SyncPlanEntry(SyncActionType.ServerOnly, path));
                 }
-                deletionHandled.Add(path);
             }
             else
             {
                 // Neither has it (from DB tracked paths) — both deleted, no action
-                deletionHandled.Add(path);
             }
         }
 

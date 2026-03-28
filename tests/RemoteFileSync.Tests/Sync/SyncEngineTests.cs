@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using RemoteFileSync.Models;
 using RemoteFileSync.State;
 using RemoteFileSync.Sync;
@@ -245,81 +246,96 @@ public class SyncEngineTests
 
     // ── SyncDatabase-backed deletion detection (new overload) ─────────────────
 
-    private static SyncDatabase CreateTestDb()
+    private static (SyncDatabase db, string dir) CreateTestDb()
     {
         var dir = Path.Combine(Path.GetTempPath(), $"rfs_engine_db_{Guid.NewGuid()}");
         Directory.CreateDirectory(dir);
-        return new SyncDatabase(Path.Combine(dir, "sync.db"));
+        return (new SyncDatabase(Path.Combine(dir, "sync.db")), dir);
     }
 
     [Fact]
     public void Db_DeletedFile_InDb_ProducesDeleteAction()
     {
         // File in db with status='exists', missing from client, present on server (untouched) → DeleteOnServer
-        using var db = CreateTestDb();
-        long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-        db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+        var (db, dir) = CreateTestDb();
+        try
+        {
+            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
+            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
 
-        var client = new FileManifest();
-        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+            var client = new FileManifest();
+            var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
 
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
+            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
 
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
-        Assert.Equal("file.txt", plan[0].RelativePath);
+            Assert.Single(plan);
+            Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
+            Assert.Equal("file.txt", plan[0].RelativePath);
+        }
+        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Fact]
     public void Db_NewFile_NotInDb_ProducesCopyAction()
     {
         // File NOT in db, on client only → ClientOnly (genuinely new)
-        using var db = CreateTestDb();
+        var (db, dir) = CreateTestDb();
+        try
+        {
+            var client = MakeManifest(new FileEntry("brand-new.txt", 50, AfterSync));
+            var server = new FileManifest();
 
-        var client = MakeManifest(new FileEntry("brand-new.txt", 50, AfterSync));
-        var server = new FileManifest();
+            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
 
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
-
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
-        Assert.Equal("brand-new.txt", plan[0].RelativePath);
+            Assert.Single(plan);
+            Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
+            Assert.Equal("brand-new.txt", plan[0].RelativePath);
+        }
+        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Fact]
     public void Db_PreviouslyDeleted_Reappeared_CopiesAgain()
     {
         // File in db with status='deleted', re-appears on client → ClientOnly
-        using var db = CreateTestDb();
-        long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-        db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
-        db.MarkDeleted("file.txt", sessionId, null);
+        var (db, dir) = CreateTestDb();
+        try
+        {
+            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
+            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+            db.MarkDeleted("file.txt", sessionId, null);
 
-        var client = MakeManifest(new FileEntry("file.txt", 100, AfterSync));
-        var server = new FileManifest();
+            var client = MakeManifest(new FileEntry("file.txt", 100, AfterSync));
+            var server = new FileManifest();
 
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
+            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
 
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
+            Assert.Single(plan);
+            Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
+        }
+        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Fact]
     public void Db_UniDirectional_ServerLostFile_RePushed()
     {
         // Bug #4 fix: uni mode, db status='exists', server missing, client has → ClientOnly (not silently dropped)
-        using var db = CreateTestDb();
-        long sessionId = db.StartSession("uni", "c:\\local", "server", 5000);
-        db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+        var (db, dir) = CreateTestDb();
+        try
+        {
+            long sessionId = db.StartSession("uni", "c:\\local", "server", 5000);
+            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
 
-        var client = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var server = new FileManifest(); // server lost the file
+            var client = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+            var server = new FileManifest(); // server lost the file
 
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: false, db: db, deleteEnabled: true);
+            var plan = SyncEngine.ComputePlan(client, server, bidirectional: false, db: db, deleteEnabled: true);
 
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
-        Assert.Equal("file.txt", plan[0].RelativePath);
+            Assert.Single(plan);
+            Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
+            Assert.Equal("file.txt", plan[0].RelativePath);
+        }
+        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Fact]
@@ -327,52 +343,64 @@ public class SyncEngineTests
     {
         // File synced now (LastSynced = UtcNow via MarkSynced), server has a version modified
         // in the future (T2 > LastSynced), client deleted → SendToClient (restore)
-        using var db = CreateTestDb();
-        long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-        db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+        var (db, dir) = CreateTestDb();
+        try
+        {
+            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
+            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
 
-        // Server file modified after the MarkSynced call (guaranteed future timestamp)
-        var serverModifiedAfterSync = DateTime.UtcNow.AddDays(1);
+            // Server file modified after the MarkSynced call (guaranteed future timestamp)
+            var serverModifiedAfterSync = DateTime.UtcNow.AddDays(1);
 
-        var client = new FileManifest(); // deleted on client
-        var server = MakeManifest(new FileEntry("file.txt", 200, serverModifiedAfterSync)); // modified on server after sync
+            var client = new FileManifest(); // deleted on client
+            var server = MakeManifest(new FileEntry("file.txt", 200, serverModifiedAfterSync)); // modified on server after sync
 
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
+            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
 
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.SendToClient, plan[0].Action);
+            Assert.Single(plan);
+            Assert.Equal(SyncActionType.SendToClient, plan[0].Action);
+        }
+        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Fact]
     public void Db_DeleteEnabled_False_NormalBehavior()
     {
         // deleteEnabled=false, db has data → ignored, normal ServerOnly behavior
-        using var db = CreateTestDb();
-        long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-        db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+        var (db, dir) = CreateTestDb();
+        try
+        {
+            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
+            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
 
-        var client = new FileManifest(); // no file on client
-        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+            var client = new FileManifest(); // no file on client
+            var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
 
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: false);
+            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: false);
 
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
+            Assert.Single(plan);
+            Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
+        }
+        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 
     [Fact]
     public void Db_BothDeletedFromDb_NoAction()
     {
         // File in db status='exists', missing from both manifests → no plan entry
-        using var db = CreateTestDb();
-        long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-        db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+        var (db, dir) = CreateTestDb();
+        try
+        {
+            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
+            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
 
-        var client = new FileManifest(); // not present
-        var server = new FileManifest(); // not present
+            var client = new FileManifest(); // not present
+            var server = new FileManifest(); // not present
 
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
+            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
 
-        Assert.Empty(plan);
+            Assert.Empty(plan);
+        }
+        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
     }
 }
