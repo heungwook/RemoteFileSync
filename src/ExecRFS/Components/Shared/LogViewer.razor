@@ -1,0 +1,91 @@
+@inject IJSRuntime JS
+@implements IDisposable
+
+<div class="log-viewer" style="display:flex; flex-direction:column; flex:0 0 200px;">
+    <div class="log-toolbar">
+        <span style="color:var(--muted); font-size:10px; text-transform:uppercase; margin-right:4px;">Log</span>
+        <button class="btn" style="font-size:10px; padding:2px 8px;"
+                @onclick="SetFilterAll">All</button>
+        <button class="btn" style="font-size:10px; padding:2px 8px;"
+                @onclick="SetFilterSrv">Server</button>
+        <button class="btn" style="font-size:10px; padding:2px 8px;"
+                @onclick="SetFilterCli">Client</button>
+        <button class="btn" style="font-size:10px; padding:2px 8px;"
+                @onclick="SetFilterError">Errors</button>
+        <button class="btn" style="font-size:10px; padding:2px 8px; margin-left:auto;"
+                @onclick="Clear">Clear</button>
+    </div>
+    <div @ref="_logContainer"
+         style="flex:1; overflow-y:auto; font-family:'Cascadia Code','Consolas',monospace; font-size:11px; line-height:1.6;">
+        @foreach (var entry in FilteredEntries())
+        {
+            <div class="log-line @GetLineClass(entry)">
+                <span style="color:var(--muted);">[@entry.Timestamp.ToString("HH:mm:ss")]</span>
+                <span style="color:var(--muted);"> [@entry.Source]</span>
+                @(" ") @entry.Message
+            </div>
+        }
+    </div>
+</div>
+
+@code {
+    [Parameter] public LogAggregator Aggregator { get; set; } = null!;
+
+    private string _filter = "all";
+    private ElementReference _logContainer;
+
+    private Action<LogEntry>? _entryHandler;
+
+    protected override void OnInitialized()
+    {
+        _entryHandler = _ => InvokeAsync(StateHasChanged);
+        Aggregator.OnEntry += _entryHandler;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("scrollToBottom", _logContainer);
+        }
+        catch { /* JS interop may fail during shutdown */ }
+    }
+
+    private void SetFilterAll()   { _filter = "all";   StateHasChanged(); }
+    private void SetFilterSrv()   { _filter = "srv";   StateHasChanged(); }
+    private void SetFilterCli()   { _filter = "cli";   StateHasChanged(); }
+    private void SetFilterError() { _filter = "error"; StateHasChanged(); }
+
+    private void Clear()
+    {
+        Aggregator.Clear();
+        StateHasChanged();
+    }
+
+    private IEnumerable<LogEntry> FilteredEntries()
+    {
+        var entries = Aggregator.Entries;
+        return _filter switch
+        {
+            "srv"   => entries.Where(e => e.Source == "SRV"),
+            "cli"   => entries.Where(e => e.Source == "CLI"),
+            "error" => entries.Where(e => e.Level == "error" || e.Level == "warning"),
+            _       => entries
+        };
+    }
+
+    private static string GetLineClass(LogEntry entry)
+    {
+        var cls = entry.Source == "SRV" ? "log-srv" : "log-cli";
+        if (entry.Level == "error")        cls += " log-error";
+        else if (entry.Level == "warning") cls += " log-warning";
+        else if (entry.Level == "delete")  cls += " log-delete";
+        return cls;
+    }
+
+    public void Dispose()
+    {
+        if (_entryHandler != null)
+            Aggregator.OnEntry -= _entryHandler;
+    }
+}
