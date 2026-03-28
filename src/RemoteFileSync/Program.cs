@@ -1,5 +1,6 @@
 using RemoteFileSync.Models;
 using RemoteFileSync.Logging;
+using RemoteFileSync.Progress;
 using RemoteFileSync.State;
 
 namespace RemoteFileSync;
@@ -23,6 +24,15 @@ public class Program
 
         using var logger = new SyncLogger(options.Verbose, options.LogFile);
         logger.Summary($"RemoteFileSync v1.0 — {(options.IsServer ? "Server" : "Client")} mode");
+
+        var progressWriter = options.JsonProgress
+            ? new Progress.JsonProgressWriter(Console.Out)
+            : Progress.JsonProgressWriter.Null;
+        using var stdinReader = options.JsonProgress
+            ? new Progress.StdinCommandReader(Console.In, Console.Out)
+            : Progress.StdinCommandReader.Null;
+        if (options.JsonProgress)
+            stdinReader.Start();
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
@@ -112,6 +122,9 @@ public class Program
                 case "--delete" or "-d":
                     options.DeleteEnabled = true;
                     break;
+                case "--json-progress":
+                    options.JsonProgress = true;
+                    break;
                 default:
                     throw new ArgumentException($"Unknown option: {arg}");
             }
@@ -138,5 +151,6 @@ public class Program
         Console.Error.WriteLine("  --max-threads, -t <n>   Max concurrent transfers (default: 1)");
         Console.Error.WriteLine("  --verbose, -v           Verbose console output");
         Console.Error.WriteLine("  --log, -l <path>        Log file path");
+        Console.Error.WriteLine("  --json-progress         JSON events to stdout (for UI integration)");
     }
 }
