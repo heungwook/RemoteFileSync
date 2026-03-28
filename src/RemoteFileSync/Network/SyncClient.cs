@@ -154,6 +154,8 @@ public sealed class SyncClient
         int filesDeleted = 0;
         long bytesTransferred = 0;
 
+        try  // Guarantee CompleteSession in finally block
+        {
         // 7. Send files to server (SendToServer + ClientOnly)
         var toSend = syncPlan.Where(p =>
             p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList();
@@ -335,14 +337,6 @@ public sealed class SyncClient
         var deletedLabel = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
         _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedLabel}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
 
-        // 12. Complete database session (always, regardless of exit code)
-        if (_db != null && sessionId > 0)
-        {
-            _db.CompleteSession(sessionId, filesTransferred, filesDeleted,
-                syncPlan.Count(p => p.Action == SyncActionType.Skip), exitCode);
-            _logger.Debug($"Sync session {sessionId} completed (exit code {exitCode})");
-        }
-
         // Fallback: save binary state when db is null (backward compat)
         if (_db == null && exitCode == 0 && _options.DeleteEnabled && _stateManager != null)
         {
@@ -352,5 +346,17 @@ public sealed class SyncClient
         }
 
         return exitCode;
+        }
+        finally
+        {
+            // 12. Guarantee session completion even on exception/cancellation
+            if (_db != null && sessionId > 0)
+            {
+                var finalExitCode = skippedFiles > 0 ? 1 : 0;
+                _db.CompleteSession(sessionId, filesTransferred, filesDeleted,
+                    syncPlan.Count(p => p.Action == SyncActionType.Skip), finalExitCode);
+                _logger.Debug($"Sync session {sessionId} completed (exit code {finalExitCode})");
+            }
+        }
     }
 }
