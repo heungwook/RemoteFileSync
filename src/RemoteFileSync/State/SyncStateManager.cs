@@ -6,6 +6,7 @@ namespace RemoteFileSync.State;
 
 public sealed record SyncState(FileManifest Manifest, DateTime LastSyncUtc);
 
+[Obsolete("Use SyncDatabase instead. Kept for migration from sync-state.bin.")]
 public sealed class SyncStateManager
 {
     private static readonly byte[] Magic = "RFS1"u8.ToArray();

@@ -415,11 +415,61 @@ LIMIT $limit;";
         return list;
     }
 
+    // ── Migration ─────────────────────────────────────────────────────────────
+
+    public static void MigrateFromBinary(string binPath, string dbPath)
+    {
+        if (!File.Exists(binPath)) return;
+        if (File.Exists(dbPath)) return; // Already migrated
+
+        try
+        {
+            List<(string path, long size, long modTicks)> entries;
+
+            // Read binary file in its own scope so the file handle is released before rename
+            using (var fs = File.OpenRead(binPath))
+            using (var reader = new BinaryReader(fs, Encoding.UTF8))
+            {
+                var magic = reader.ReadBytes(4);
+                if (!magic.AsSpan().SequenceEqual("RFS1"u8)) return;
+
+                reader.ReadInt64(); // lastSyncTicks (unused)
+                int count = reader.ReadInt32();
+                entries = new List<(string path, long size, long modTicks)>(count);
+                for (int i = 0; i < count; i++)
+                {
+                    short pathLen = reader.ReadInt16();
+                    var path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+                    long size = reader.ReadInt64();
+                    long modTicks = reader.ReadInt64();
+                    entries.Add((path, size, modTicks));
+                }
+            }
+
+            using (var db = new SyncDatabase(dbPath))
+            {
+                var sessionId = db.StartSession("migration", "", "", 0);
+                foreach (var (path, size, modTicks) in entries)
+                {
+                    db.MarkSynced(path, size, new DateTime(modTicks, DateTimeKind.Utc), sessionId, "migration");
+                }
+                db.CompleteSession(sessionId, entries.Count, 0, 0, 0);
+            }
+
+            File.Move(binPath, binPath + ".migrated");
+        }
+        catch
+        {
+            // Migration failed — start fresh
+        }
+    }
+
     // ── IDisposable ───────────────────────────────────────────────────────────
 
     public void Dispose()
     {
         _conn.Close();
         _conn.Dispose();
+        SqliteConnection.ClearAllPools();
     }
 }
