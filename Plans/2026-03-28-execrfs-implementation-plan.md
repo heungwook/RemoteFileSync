@@ -50,11 +50,21 @@ src/ExecRFS/
 │   ├── SyncInstanceState.cs
 │   └── ProgressEvent.cs
 ├── Services/
+│   ├── SyncProcesses.cs               # Holder for server+client ProcessManager (DI-friendly)
 │   ├── ProcessManager.cs
 │   ├── ProfileService.cs
 │   ├── CommandBuilder.cs
 │   └── LogAggregator.cs
 └── _Imports.razor
+
+tests/ExecRFS.Tests/
+├── ExecRFS.Tests.csproj
+├── Services/
+│   ├── CommandBuilderTests.cs
+│   ├── ProfileServiceTests.cs
+│   └── LogAggregatorTests.cs
+└── Models/
+    └── ProgressEventTests.cs
 ```
 
 ---
@@ -608,38 +618,127 @@ public SyncClient(SyncOptions options, SyncLogger logger,
 }
 ```
 
-- [ ] **Step 2: Add JSON event emissions to SyncClient.HandleConnectionAsync**
+- [ ] **Step 2: Add JSON event emissions to SyncClient.RunAsync and HandleConnectionAsync**
 
-Insert event calls at these key points:
+In `SyncClient.RunAsync`, after the retry loop succeeds (before the mode label log), add:
 
-After connecting: `_progress.WriteStatus("connecting", _options.Host, _options.Port);`
-After handshake: `_progress.WriteStatus("connected", mode: $"{modeLabel}{deleteLabel}");`
-After local manifest scan: `_progress.WriteManifest("local", clientManifest.Count, ...);`
-After remote manifest received: `_progress.WriteManifest("remote", serverManifest.Count, ...);`
-After sync plan computed: `_progress.WritePlan(transferCount, deleteCount, skipCount);`
-Before each file send: `_progress.WriteFileStart("send", action.RelativePath, fi.Length, ...);`
-After each file send: `_progress.WriteFileEnd(action.RelativePath, true, thread: ...);`
-After sync complete: `_progress.WriteComplete(filesTransferred, filesDeleted, bytesTransferred, sw.ElapsedMilliseconds, exitCode);`
+```csharp
+_progress.WriteStatus("connecting", host: _options.Host, port: _options.Port);
+```
+
+After the `_logger.Summary($"Connected. {modeLabel}...")` line, add:
+
+```csharp
+_progress.WriteStatus("connected", mode: $"{modeLabel}{deleteLabel}");
+```
+
+In `HandleConnectionAsync`, after `var clientManifest = scanner.Scan();`, add:
+
+```csharp
+long localBytes = clientManifest.Entries.Sum(e => e.FileSize);
+_progress.WriteManifest("local", clientManifest.Count, localBytes);
+```
+
+After `var serverManifest = ProtocolHandler.DeserializeManifest(mData);`, add:
+
+```csharp
+long remoteBytes = serverManifest.Entries.Sum(e => e.FileSize);
+_progress.WriteManifest("remote", serverManifest.Count, remoteBytes);
+```
+
+After the sync plan logging (`_logger.Info($"Sync plan: {transferCount}..."`), add:
+
+```csharp
+_progress.WritePlan(transferCount, deleteCount, skipCount);
+```
+
+In the `foreach (var action in toSend)` loop, before `await sender.SendFileAsync(...)`, add:
+
+```csharp
+var fi = new FileInfo(Path.Combine(_options.Folder, action.RelativePath.Replace('/', Path.DirectorySeparatorChar)));
+_progress.WriteFileStart("send", action.RelativePath, fi.Exists ? fi.Length : 0, compressed: false, thread: filesTransferred % _options.MaxThreads);
+```
+
+After `filesTransferred++`, add:
+
+```csharp
+_progress.WriteFileEnd(action.RelativePath, success: true, thread: (filesTransferred - 1) % _options.MaxThreads);
+```
+
+In the catch block, add:
+
+```csharp
+_progress.WriteFileEnd(action.RelativePath, success: false, error: ex.Message);
+```
+
+Before the SyncComplete exchange, add:
+
+```csharp
+_progress.WriteComplete(filesTransferred, filesDeleted, bytesTransferred, sw.ElapsedMilliseconds, exitCode);
+```
+
+In the receive loop (`foreach (var action in toReceive)`), add similar `WriteFileStart`/`WriteFileEnd` calls with `action: "receive"`.
+
+For deletion phases, after each successful deletion add:
+
+```csharp
+_progress.WriteDelete(del.RelativePath, backed_up: true, success: true);
+```
+
+And for failed deletions:
+
+```csharp
+_progress.WriteDelete(del.RelativePath, backed_up: false, success: false, error: "Server failed");
+```
 
 - [ ] **Step 3: Add pause gate checks to SyncClient**
 
-Between file transfers in the send loop, add:
+At the start of the `foreach (var action in toSend)` loop body, before `try {`, add:
 
 ```csharp
-// Check pause gate before each file
 _stdinReader.PauseGate.Wait();
 if (_stdinReader.StopToken.IsCancellationRequested)
 {
     _logger.Warning("Stop requested. Finishing current operations...");
+    _progress.WriteStatus("stopping");
     break;
 }
 ```
 
-Add the same pattern in the receive loop.
+Add the identical pattern at the start of the receive loop body and the deletion loop body.
 
-- [ ] **Step 4: Update SyncServer constructor similarly**
+- [ ] **Step 4: Update SyncServer constructor and add events + pause gate**
 
-Add `JsonProgressWriter` and `StdinCommandReader` parameters with the same pattern as SyncClient. Add event emissions at key points (listening, client connected, file received, sync complete). Add pause gate checks between file receives/sends.
+Add the same fields and constructor pattern to `SyncServer`:
+
+```csharp
+using RemoteFileSync.Progress;
+
+private readonly JsonProgressWriter _progress;
+private readonly StdinCommandReader _stdinReader;
+
+public SyncServer(SyncOptions options, SyncLogger logger,
+                  JsonProgressWriter? progressWriter = null,
+                  StdinCommandReader? stdinReader = null)
+{
+    _options = options;
+    _logger = logger;
+    _progress = progressWriter ?? JsonProgressWriter.Null;
+    _stdinReader = stdinReader ?? StdinCommandReader.Null;
+}
+```
+
+Add event emissions at these specific points in `SyncServer`:
+
+After `listener.Start()`: `_progress.WriteStatus("listening", port: _options.Port);`
+After `AcceptTcpClientAsync`: `_progress.WriteStatus("connected");`
+After server manifest scan: `_progress.WriteManifest("local", serverManifest.Count, serverBytes);`
+After receiving client manifest: `_progress.WriteManifest("remote", clientManifest.Count, clientBytes);`
+Before each file receive: `_progress.WriteFileStart("receive", ...);`
+After each file receive: `_progress.WriteFileEnd(...);`
+Before SyncComplete: `_progress.WriteComplete(filesTransferred, filesDeleted, bytesTransferred, sw.ElapsedMilliseconds, exitCode);`
+
+Add pause gate checks at the start of each file loop body (same pattern as SyncClient Step 3).
 
 - [ ] **Step 5: Update Program.cs to pass writer/reader to constructors**
 
@@ -702,6 +801,7 @@ Create `src/ExecRFS/ExecRFS.csproj`:
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <RootNamespace>ExecRFS</RootNamespace>
     <AssemblyName>ExecRFS</AssemblyName>
     <Nullable>enable</Nullable>
@@ -709,6 +809,9 @@ Create `src/ExecRFS/ExecRFS.csproj`:
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Wpf" Version="10.0.*" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
 ```
@@ -748,13 +851,14 @@ Create `src/ExecRFS/MainWindow.xaml`:
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:blazor="clr-namespace:Microsoft.AspNetCore.Components.WebView.Wpf;assembly=Microsoft.AspNetCore.Components.WebView.Wpf"
+        xmlns:layout="clr-namespace:ExecRFS.Components.Layout"
         Title="ExecRFS — RemoteFileSync Manager"
         Width="1200" Height="800" MinWidth="900" MinHeight="600"
         WindowStartupLocation="CenterScreen"
         Background="#0d1117">
     <blazor:BlazorWebView x:Name="blazorWebView" HostPage="wwwroot/index.html">
         <blazor:BlazorWebView.RootComponents>
-            <blazor:RootComponent Selector="#app" ComponentType="{x:Type local:Components.Layout.MainLayout}" />
+            <blazor:RootComponent Selector="#app" ComponentType="{x:Type layout:MainLayout}" />
         </blazor:BlazorWebView.RootComponents>
     </blazor:BlazorWebView>
 </Window>
@@ -777,24 +881,50 @@ public partial class MainWindow : Window
 
         var services = new ServiceCollection();
         services.AddWpfBlazorWebView();
+#if DEBUG
+        services.AddBlazorWebViewDeveloperTools();
+#endif
         services.AddSingleton<ProfileService>();
         services.AddSingleton<LogAggregator>();
-        services.AddSingleton(new ProcessManager("server"));
-        services.AddSingleton(new ProcessManager("client"));
+        services.AddSingleton(new SyncProcesses(
+            new ProcessManager("server"),
+            new ProcessManager("client")));
 
-        blazorWebView.Services = services.BuildServiceProvider();
+        var sp = services.BuildServiceProvider();
+        blazorWebView.Services = sp;
 
         Closing += (_, _) =>
         {
-            // Auto-save last session profile on window close
-            var profileService = blazorWebView.Services.GetService<ProfileService>();
-            profileService?.AutoSave();
+            sp.GetService<ProfileService>()?.AutoSave();
+            var procs = sp.GetService<SyncProcesses>();
+            procs?.Server.Dispose();
+            procs?.Client.Dispose();
         };
     }
 }
 ```
 
-Note: The `local:` xmlns prefix needs to be added to the XAML for the ComponentType binding. The exact namespace setup may require adjustment based on the .NET 10 Blazor WebView API. The engineer should verify the correct xmlns mapping.
+Also create `src/ExecRFS/Services/SyncProcesses.cs` — a simple holder for the two `ProcessManager` instances so DI can resolve them as a single service:
+
+```csharp
+namespace ExecRFS.Services;
+
+/// <summary>
+/// Holds the server and client ProcessManager instances.
+/// Registered as a singleton in DI so Blazor components can inject it.
+/// </summary>
+public sealed class SyncProcesses
+{
+    public ProcessManager Server { get; }
+    public ProcessManager Client { get; }
+
+    public SyncProcesses(ProcessManager server, ProcessManager client)
+    {
+        Server = server;
+        Client = client;
+    }
+}
+```
 
 - [ ] **Step 4: Create wwwroot/index.html**
 
@@ -810,6 +940,14 @@ Create `src/ExecRFS/wwwroot/index.html`:
 </head>
 <body>
     <div id="app">Loading...</div>
+    <script>
+        window.scrollToBottom = function(el) {
+            if (el) { el.scrollTop = el.scrollHeight; }
+        };
+        window.copyToClipboard = function(text) {
+            navigator.clipboard.writeText(text);
+        };
+    </script>
     <script src="_framework/blazor.webview.js"></script>
 </body>
 </html>
@@ -822,6 +960,7 @@ Create `src/ExecRFS/_Imports.razor`:
 ```razor
 @using Microsoft.AspNetCore.Components
 @using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
 @using ExecRFS.Models
 @using ExecRFS.Services
 @using ExecRFS.Components.Shared
@@ -1621,6 +1760,9 @@ Create `src/ExecRFS/Components/Layout/MainLayout.razor`:
 
 ```razor
 @inject ProfileService ProfileService
+@inject SyncProcesses SyncProcs
+@inject LogAggregator LogAgg
+@inject IJSRuntime JS
 @implements IDisposable
 
 <div class="main-layout">
@@ -1638,6 +1780,8 @@ Create `src/ExecRFS/Components/Layout/MainLayout.razor`:
 
         <button class="btn" @onclick="SaveProfile">Save</button>
         <button class="btn" @onclick="SaveProfileAs">Save As...</button>
+        <button class="btn" style="color:var(--red);" @onclick="DeleteProfile"
+                disabled="@(string.IsNullOrEmpty(_currentProfileName))">Delete</button>
 
         <div style="margin-left:auto;display:flex;gap:4px;">
             <button class="btn" @onclick="GenerateCommand">Generate CMD</button>
@@ -1647,16 +1791,16 @@ Create `src/ExecRFS/Components/Layout/MainLayout.razor`:
     <!-- Split Panels -->
     <div class="split-panels">
         <ServerPanel Profile="@ProfileService.CurrentProfile"
-                     ProcessManager="@_serverProcess" />
+                     ProcessManager="@SyncProcs.Server" />
         <ClientPanel Profile="@ProfileService.CurrentProfile"
-                     ProcessManager="@_clientProcess" />
+                     ProcessManager="@SyncProcs.Client" />
     </div>
 
     <!-- Progress Bar -->
-    <ProgressBar ServerProcess="@_serverProcess" ClientProcess="@_clientProcess" />
+    <ProgressBar ServerProcess="@SyncProcs.Server" ClientProcess="@SyncProcs.Client" />
 
     <!-- Log Viewer -->
-    <LogViewer Aggregator="@_logAggregator" />
+    <LogViewer Aggregator="@LogAgg" />
 </div>
 
 @if (_showSaveDialog)
@@ -1676,10 +1820,20 @@ Create `src/ExecRFS/Components/Layout/MainLayout.razor`:
 @if (_showCommandPreview)
 {
     <div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:100;">
-        <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;width:600px;">
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;width:650px;">
             <h3 style="margin-bottom:12px;">Generated CLI Commands</h3>
-            <pre style="background:var(--bg);padding:12px;border-radius:4px;font-size:11px;white-space:pre-wrap;margin-bottom:12px;max-height:300px;overflow-y:auto;">@_commandPreview</pre>
+            <div style="margin-bottom:8px;">
+                <div class="field-label">Server Command</div>
+                <pre style="background:var(--bg);padding:8px;border-radius:4px;font-size:11px;white-space:pre-wrap;">@_serverCmd</pre>
+            </div>
+            <div style="margin-bottom:12px;">
+                <div class="field-label">Client Command</div>
+                <pre style="background:var(--bg);padding:8px;border-radius:4px;font-size:11px;white-space:pre-wrap;">@_clientCmd</pre>
+            </div>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button class="btn" @onclick="CopyServerCmd">Copy Server</button>
+                <button class="btn" @onclick="CopyClientCmd">Copy Client</button>
+                <button class="btn" @onclick="CopyBothCmds">Copy Both</button>
                 <button class="btn" @onclick="() => _showCommandPreview = false">Close</button>
             </div>
         </div>
@@ -1687,29 +1841,20 @@ Create `src/ExecRFS/Components/Layout/MainLayout.razor`:
 }
 
 @code {
-    [Inject] private ProcessManager _serverProcessDI { get; set; } = default!;
-    [Inject] private LogAggregator _logAggregator { get; set; } = default!;
-
-    private ProcessManager _serverProcess = default!;
-    private ProcessManager _clientProcess = default!;
     private List<string> _profiles = new();
     private string _currentProfileName = "";
     private bool _showSaveDialog;
     private string _saveAsName = "";
     private bool _showCommandPreview;
-    private string _commandPreview = "";
+    private string _serverCmd = "";
+    private string _clientCmd = "";
 
     protected override void OnInitialized()
     {
-        // Resolve the two ProcessManager instances by role
-        // In a real DI setup, use named/keyed services. For simplicity, create inline:
-        _serverProcess = new ProcessManager("server");
-        _clientProcess = new ProcessManager("client");
-
-        _serverProcess.OnLogLine += line => { _logAggregator.AddLine("SRV", line); InvokeAsync(StateHasChanged); };
-        _clientProcess.OnLogLine += line => { _logAggregator.AddLine("CLI", line); InvokeAsync(StateHasChanged); };
-        _serverProcess.OnStateChanged += _ => InvokeAsync(StateHasChanged);
-        _clientProcess.OnStateChanged += _ => InvokeAsync(StateHasChanged);
+        SyncProcs.Server.OnLogLine += line => { LogAgg.AddLine("SRV", line); InvokeAsync(StateHasChanged); };
+        SyncProcs.Client.OnLogLine += line => { LogAgg.AddLine("CLI", line); InvokeAsync(StateHasChanged); };
+        SyncProcs.Server.OnStateChanged += _ => InvokeAsync(StateHasChanged);
+        SyncProcs.Client.OnStateChanged += _ => InvokeAsync(StateHasChanged);
 
         ProfileService.CurrentProfile = ProfileService.LoadLastSession();
         _profiles = ProfileService.ListProfiles();
@@ -1726,19 +1871,12 @@ Create `src/ExecRFS/Components/Layout/MainLayout.razor`:
     private void SaveProfile()
     {
         if (string.IsNullOrWhiteSpace(ProfileService.CurrentProfile.Name) || ProfileService.CurrentProfile.Name == "Untitled")
-        {
-            SaveProfileAs();
-            return;
-        }
+        { SaveProfileAs(); return; }
         ProfileService.Save(ProfileService.CurrentProfile);
         _profiles = ProfileService.ListProfiles();
     }
 
-    private void SaveProfileAs()
-    {
-        _saveAsName = ProfileService.CurrentProfile.Name;
-        _showSaveDialog = true;
-    }
+    private void SaveProfileAs() { _saveAsName = ProfileService.CurrentProfile.Name; _showSaveDialog = true; }
 
     private void ConfirmSaveAs()
     {
@@ -1750,16 +1888,29 @@ Create `src/ExecRFS/Components/Layout/MainLayout.razor`:
         _showSaveDialog = false;
     }
 
+    private void DeleteProfile()
+    {
+        if (string.IsNullOrEmpty(_currentProfileName)) return;
+        ProfileService.Delete(_currentProfileName);
+        _currentProfileName = "";
+        ProfileService.CurrentProfile = new SyncProfile();
+        _profiles = ProfileService.ListProfiles();
+    }
+
     private void GenerateCommand()
     {
-        _commandPreview = CommandBuilder.BuildBoth(ProfileService.CurrentProfile);
+        _serverCmd = CommandBuilder.Build(ProfileService.CurrentProfile, isServer: true);
+        _clientCmd = CommandBuilder.Build(ProfileService.CurrentProfile, isServer: false);
         _showCommandPreview = true;
     }
 
+    private async Task CopyServerCmd() => await JS.InvokeVoidAsync("copyToClipboard", _serverCmd);
+    private async Task CopyClientCmd() => await JS.InvokeVoidAsync("copyToClipboard", _clientCmd);
+    private async Task CopyBothCmds() => await JS.InvokeVoidAsync("copyToClipboard", $"{_serverCmd}\n\n{_clientCmd}");
+
     public void Dispose()
     {
-        _serverProcess?.Dispose();
-        _clientProcess?.Dispose();
+        // ProcessManagers are disposed by MainWindow.Closing handler
     }
 }
 ```
@@ -1789,7 +1940,7 @@ Create `src/ExecRFS/Components/Shared/FolderPicker.razor`:
 <div class="field">
     <div class="field-label">@Label</div>
     <div class="field-row">
-        <input type="text" @bind="Value" @bind:event="oninput" placeholder="@Placeholder"
+        <input type="text" value="@Value" @oninput="OnInput" placeholder="@Placeholder"
                style="flex:1;" />
         <button class="btn" @onclick="Browse">Browse</button>
     </div>
@@ -1797,13 +1948,18 @@ Create `src/ExecRFS/Components/Shared/FolderPicker.razor`:
 
 @code {
     [Parameter] public string Label { get; set; } = "Folder";
-    [Parameter] public string Value { get; set; } = "";
-    [Parameter] public EventCallback<string> ValueChanged { get; set; }
+    [Parameter] public string? Value { get; set; }
+    [Parameter] public EventCallback<string?> ValueChanged { get; set; }
     [Parameter] public string Placeholder { get; set; } = "";
+
+    private async Task OnInput(ChangeEventArgs e)
+    {
+        Value = e.Value?.ToString();
+        await ValueChanged.InvokeAsync(Value);
+    }
 
     private async Task Browse()
     {
-        // Use WPF FolderBrowserDialog via dispatcher
         var folder = await Task.Run(() =>
         {
             string? result = null;
@@ -1811,7 +1967,7 @@ Create `src/ExecRFS/Components/Shared/FolderPicker.razor`:
             {
                 var dialog = new System.Windows.Forms.FolderBrowserDialog();
                 if (!string.IsNullOrEmpty(Value))
-                    dialog.InitialDirectory = Value;
+                    dialog.SelectedPath = Value;
                 if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
                     result = dialog.SelectedPath;
             });
@@ -1875,8 +2031,8 @@ Create `src/ExecRFS/Components/Shared/PatternList.razor`:
     {
         if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(_newPattern))
         {
-            Patterns.Add(_newPattern.Trim());
-            await PatternsChanged.InvokeAsync(Patterns);
+            var updated = new List<string>(Patterns) { _newPattern.Trim() };
+            await PatternsChanged.InvokeAsync(updated);
             _newPattern = "";
             _adding = false;
         }
@@ -1888,8 +2044,9 @@ Create `src/ExecRFS/Components/Shared/PatternList.razor`:
 
     private async Task Remove(string pattern)
     {
-        Patterns.Remove(pattern);
-        await PatternsChanged.InvokeAsync(Patterns);
+        var updated = new List<string>(Patterns);
+        updated.Remove(pattern);
+        await PatternsChanged.InvokeAsync(updated);
     }
 }
 ```
@@ -1899,10 +2056,12 @@ Create `src/ExecRFS/Components/Shared/PatternList.razor`:
 Create `src/ExecRFS/Components/Shared/ProgressBar.razor`:
 
 ```razor
+@implements IDisposable
+
 <div class="progress-section">
     <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);">
         <span>Progress: <strong style="color:var(--text);">@_filesCompleted of @_totalFiles files</strong></span>
-        <span>@FormatBytes(_bytesCompleted) / @FormatBytes(_totalBytes)</span>
+        <span>@FormatBytes(TotalBytesCompleted) / @FormatBytes(_totalBytes)</span>
         <span style="color:var(--yellow);">Elapsed: @_elapsed</span>
     </div>
     <div class="progress-bar-track">
@@ -1916,12 +2075,15 @@ Create `src/ExecRFS/Components/Shared/ProgressBar.razor`:
 
     private int _filesCompleted;
     private int _totalFiles;
-    private long _bytesCompleted;
+    private long _bytesForCompletedFiles;
+    private long _bytesForCurrentFile;
     private long _totalBytes;
     private string _elapsed = "00:00:00";
     private int _percent;
     private DateTime _startTime;
     private System.Timers.Timer? _timer;
+
+    private long TotalBytesCompleted => _bytesForCompletedFiles + _bytesForCurrentFile;
 
     protected override void OnInitialized()
     {
@@ -1945,19 +2107,32 @@ Create `src/ExecRFS/Components/Shared/ProgressBar.razor`:
             case "plan":
                 _totalFiles = (evt.Transfers ?? 0) + (evt.Deletes ?? 0);
                 _filesCompleted = 0;
+                _bytesForCompletedFiles = 0;
+                _bytesForCurrentFile = 0;
                 _startTime = DateTime.Now;
                 _timer?.Start();
                 break;
-            case "file_end":
-                if (evt.Success == true) _filesCompleted++;
+            case "manifest":
+                if (evt.Side == "local") _totalBytes += evt.Bytes ?? 0;
+                break;
+            case "file_start":
+                _bytesForCurrentFile = 0;
                 break;
             case "file_progress":
-                _bytesCompleted = evt.BytesSent ?? 0;
-                _totalBytes = evt.TotalBytes ?? _totalBytes;
+                _bytesForCurrentFile = evt.BytesSent ?? 0;
+                break;
+            case "file_end":
+                if (evt.Success == true)
+                {
+                    _filesCompleted++;
+                    _bytesForCompletedFiles += _bytesForCurrentFile;
+                }
+                _bytesForCurrentFile = 0;
                 break;
             case "complete":
-                _bytesCompleted = evt.Bytes ?? 0;
-                _totalBytes = evt.Bytes ?? 0;
+                _bytesForCompletedFiles = evt.Bytes ?? 0;
+                _bytesForCurrentFile = 0;
+                _totalBytes = evt.Bytes ?? _totalBytes;
                 _filesCompleted = evt.FilesTransferred ?? 0;
                 _timer?.Stop();
                 break;
@@ -1973,6 +2148,12 @@ Create `src/ExecRFS/Components/Shared/ProgressBar.razor`:
         < 1024 * 1024 * 1024 => $"{bytes / (1024.0 * 1024.0):F1} MB",
         _ => $"{bytes / (1024.0 * 1024.0 * 1024.0):F2} GB"
     };
+
+    public void Dispose()
+    {
+        _timer?.Stop();
+        _timer?.Dispose();
+    }
 }
 ```
 
@@ -1981,6 +2162,7 @@ Create `src/ExecRFS/Components/Shared/ProgressBar.razor`:
 Create `src/ExecRFS/Components/Shared/LogViewer.razor`:
 
 ```razor
+@inject IJSRuntime JS
 @implements IDisposable
 
 <div class="log-viewer" @ref="_logContainer">
@@ -2011,6 +2193,7 @@ Create `src/ExecRFS/Components/Shared/LogViewer.razor`:
     private ElementReference _logContainer;
     private bool _autoScroll = true;
     private string _filter = "all";
+    private Action<LogEntry>? _entryHandler;
 
     private IEnumerable<LogEntry> FilteredEntries => _filter switch
     {
@@ -2022,11 +2205,21 @@ Create `src/ExecRFS/Components/Shared/LogViewer.razor`:
 
     protected override void OnInitialized()
     {
-        Aggregator.OnEntry += _ => InvokeAsync(StateHasChanged);
+        _entryHandler = _ => InvokeAsync(StateHasChanged);
+        Aggregator.OnEntry += _entryHandler;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_autoScroll)
+        {
+            try { await JS.InvokeVoidAsync("scrollToBottom", _logContainer); }
+            catch (ObjectDisposedException) { }
+        }
     }
 
     private void ToggleAutoScroll() => _autoScroll = !_autoScroll;
-    private void Clear() => Aggregator.Clear();
+    private void Clear() { Aggregator.Clear(); StateHasChanged(); }
     private void OnFilterChanged(ChangeEventArgs e) => _filter = e.Value?.ToString() ?? "all";
 
     private static string GetSourceClass(string source) => source switch
@@ -2046,7 +2239,8 @@ Create `src/ExecRFS/Components/Shared/LogViewer.razor`:
 
     public void Dispose()
     {
-        // Unsubscribe handled by GC since Action delegates don't prevent collection
+        if (_entryHandler != null)
+            Aggregator.OnEntry -= _entryHandler;
     }
 }
 ```
@@ -2322,7 +2516,328 @@ git commit -m "feat: add ServerPanel and ClientPanel Blazor components"
 
 ---
 
-## Task 14: Final Build Verification and Push
+## Task 14: ExecRFS Unit Tests
+
+**Files:**
+- Create: `tests/ExecRFS.Tests/ExecRFS.Tests.csproj`
+- Create: `tests/ExecRFS.Tests/Services/CommandBuilderTests.cs`
+- Create: `tests/ExecRFS.Tests/Services/ProfileServiceTests.cs`
+- Create: `tests/ExecRFS.Tests/Services/LogAggregatorTests.cs`
+- Create: `tests/ExecRFS.Tests/Models/ProgressEventTests.cs`
+
+- [ ] **Step 1: Create test project**
+
+```bash
+cd E:\RemoteFileSync
+dotnet new xunit --name ExecRFS.Tests --output tests/ExecRFS.Tests --framework net10.0
+dotnet sln add tests/ExecRFS.Tests/ExecRFS.Tests.csproj
+dotnet add tests/ExecRFS.Tests/ExecRFS.Tests.csproj reference src/ExecRFS/ExecRFS.csproj
+```
+
+- [ ] **Step 2: Create CommandBuilderTests**
+
+Create `tests/ExecRFS.Tests/Services/CommandBuilderTests.cs`:
+
+```csharp
+using ExecRFS.Models;
+using ExecRFS.Services;
+
+namespace ExecRFS.Tests.Services;
+
+public class CommandBuilderTests
+{
+    [Fact]
+    public void Build_ServerMode_GeneratesCorrectArgs()
+    {
+        var profile = new SyncProfile { ServerFolder = @"D:\Sync", ServerPort = 15782 };
+        var cmd = CommandBuilder.Build(profile, isServer: true);
+        Assert.Contains("server", cmd);
+        Assert.Contains("--folder \"D:\\Sync\"", cmd);
+        Assert.Contains("--port 15782", cmd);
+        Assert.DoesNotContain("--host", cmd);
+        Assert.DoesNotContain("--bidirectional", cmd);
+    }
+
+    [Fact]
+    public void Build_ClientMode_AllOptions_GeneratesCorrectArgs()
+    {
+        var profile = new SyncProfile
+        {
+            ClientHost = "10.0.1.50", ClientFolder = @"C:\Sync", ClientPort = 20000,
+            Bidirectional = true, DeleteEnabled = true,
+            ClientBlockSize = 262144, ClientMaxThreads = 4,
+            ClientBackupFolder = @"C:\Backups",
+            IncludePatterns = new() { "*.cs", "*.csproj" },
+            ExcludePatterns = new() { "*.tmp" },
+            ClientLogFile = @"C:\Logs\sync.log"
+        };
+        var cmd = CommandBuilder.Build(profile, isServer: false);
+        Assert.Contains("client", cmd);
+        Assert.Contains("--host \"10.0.1.50\"", cmd);
+        Assert.Contains("--bidirectional", cmd);
+        Assert.Contains("--delete", cmd);
+        Assert.Contains("--block-size 262144", cmd);
+        Assert.Contains("--max-threads 4", cmd);
+        Assert.Contains("--backup-folder \"C:\\Backups\"", cmd);
+        Assert.Contains("--include \"*.cs\"", cmd);
+        Assert.Contains("--include \"*.csproj\"", cmd);
+        Assert.Contains("--exclude \"*.tmp\"", cmd);
+        Assert.Contains("--log \"C:\\Logs\\sync.log\"", cmd);
+    }
+
+    [Fact]
+    public void Build_DefaultValues_Omitted()
+    {
+        var profile = new SyncProfile { ServerFolder = @"D:\Sync" };
+        var cmd = CommandBuilder.Build(profile, isServer: true);
+        Assert.DoesNotContain("--block-size", cmd); // 65536 is default, omitted
+        Assert.DoesNotContain("--max-threads", cmd); // 1 is default, omitted
+        Assert.DoesNotContain("--backup-folder", cmd); // null, omitted
+    }
+
+    [Fact]
+    public void BuildForProcess_AppendsJsonProgress()
+    {
+        var profile = new SyncProfile { ServerFolder = @"D:\Sync" };
+        var cmd = CommandBuilder.BuildForProcess(profile, isServer: true);
+        Assert.Contains("--json-progress", cmd);
+    }
+}
+```
+
+- [ ] **Step 3: Create ProfileServiceTests**
+
+Create `tests/ExecRFS.Tests/Services/ProfileServiceTests.cs`:
+
+```csharp
+using ExecRFS.Models;
+using ExecRFS.Services;
+
+namespace ExecRFS.Tests.Services;
+
+public class ProfileServiceTests : IDisposable
+{
+    private readonly string _tempDir;
+    private readonly ProfileService _service;
+
+    public ProfileServiceTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"execrfs_profile_test_{Guid.NewGuid()}");
+        _service = new ProfileService(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir)) Directory.Delete(_tempDir, recursive: true);
+    }
+
+    [Fact]
+    public void SaveAndLoad_RoundTrips()
+    {
+        var profile = new SyncProfile
+        {
+            Name = "Test Profile",
+            ServerFolder = @"D:\Sync",
+            ClientHost = "10.0.1.50",
+            Bidirectional = true,
+            IncludePatterns = new() { "*.cs", "*.csproj" }
+        };
+        _service.Save(profile);
+        var loaded = _service.Load("Test Profile");
+        Assert.Equal("Test Profile", loaded.Name);
+        Assert.Equal(@"D:\Sync", loaded.ServerFolder);
+        Assert.Equal("10.0.1.50", loaded.ClientHost);
+        Assert.True(loaded.Bidirectional);
+        Assert.Equal(2, loaded.IncludePatterns.Count);
+    }
+
+    [Fact]
+    public void ListProfiles_ReturnsNames()
+    {
+        _service.Save(new SyncProfile { Name = "Alpha" });
+        _service.Save(new SyncProfile { Name = "Beta" });
+        var names = _service.ListProfiles();
+        Assert.Equal(2, names.Count);
+        Assert.Contains("alpha", names);
+        Assert.Contains("beta", names);
+    }
+
+    [Fact]
+    public void Delete_RemovesFile()
+    {
+        _service.Save(new SyncProfile { Name = "ToDelete" });
+        Assert.Single(_service.ListProfiles());
+        _service.Delete("ToDelete");
+        Assert.Empty(_service.ListProfiles());
+    }
+
+    [Fact]
+    public void AutoSave_And_LoadLastSession()
+    {
+        _service.CurrentProfile = new SyncProfile { Name = "Current", ClientHost = "192.168.1.1" };
+        _service.AutoSave();
+        var loaded = _service.LoadLastSession();
+        Assert.Equal("Current", loaded.Name);
+        Assert.Equal("192.168.1.1", loaded.ClientHost);
+    }
+}
+```
+
+- [ ] **Step 4: Create LogAggregatorTests**
+
+Create `tests/ExecRFS.Tests/Services/LogAggregatorTests.cs`:
+
+```csharp
+using ExecRFS.Services;
+
+namespace ExecRFS.Tests.Services;
+
+public class LogAggregatorTests
+{
+    [Fact]
+    public void AddLine_MergesSourcesChronologically()
+    {
+        var agg = new LogAggregator();
+        agg.AddLine("SRV", "Server started");
+        agg.AddLine("CLI", "Client connected");
+        agg.AddLine("SRV", "File received");
+
+        Assert.Equal(3, agg.Entries.Count);
+        Assert.Equal("SRV", agg.Entries[0].Source);
+        Assert.Equal("CLI", agg.Entries[1].Source);
+        Assert.Equal("SRV", agg.Entries[2].Source);
+    }
+
+    [Fact]
+    public void CircularBuffer_BoundsAt5000()
+    {
+        var agg = new LogAggregator();
+        for (int i = 0; i < 5100; i++)
+            agg.AddLine("SRV", $"Line {i}");
+
+        Assert.Equal(5000, agg.Entries.Count);
+        Assert.Contains("Line 5099", agg.Entries[^1].Message);
+        Assert.Contains("Line 100", agg.Entries[0].Message);
+    }
+
+    [Fact]
+    public void Clear_RemovesAllEntries()
+    {
+        var agg = new LogAggregator();
+        agg.AddLine("SRV", "test");
+        agg.Clear();
+        Assert.Empty(agg.Entries);
+    }
+
+    [Fact]
+    public void ParseLevel_DetectsErrors()
+    {
+        var agg = new LogAggregator();
+        agg.AddLine("SRV", "[ERR] Something failed");
+        Assert.Equal("error", agg.Entries[0].Level);
+    }
+
+    [Fact]
+    public void OnEntry_FiresForEachLine()
+    {
+        var agg = new LogAggregator();
+        int count = 0;
+        agg.OnEntry += _ => count++;
+        agg.AddLine("SRV", "test1");
+        agg.AddLine("CLI", "test2");
+        Assert.Equal(2, count);
+    }
+}
+```
+
+- [ ] **Step 5: Create ProgressEventTests**
+
+Create `tests/ExecRFS.Tests/Models/ProgressEventTests.cs`:
+
+```csharp
+using ExecRFS.Models;
+
+namespace ExecRFS.Tests.Models;
+
+public class ProgressEventTests
+{
+    [Fact]
+    public void TryParse_StatusEvent()
+    {
+        var evt = ProgressEvent.TryParse("{\"event\":\"status\",\"state\":\"connecting\",\"host\":\"10.0.1.50\",\"port\":15782}");
+        Assert.NotNull(evt);
+        Assert.Equal("status", evt.Event);
+        Assert.Equal("connecting", evt.State);
+        Assert.Equal("10.0.1.50", evt.Host);
+        Assert.Equal(15782, evt.Port);
+    }
+
+    [Fact]
+    public void TryParse_FileProgressEvent()
+    {
+        var evt = ProgressEvent.TryParse("{\"event\":\"file_progress\",\"path\":\"docs/report.docx\",\"bytes_sent\":1400000,\"total_bytes\":2100000,\"thread\":1}");
+        Assert.NotNull(evt);
+        Assert.Equal("file_progress", evt.Event);
+        Assert.Equal("docs/report.docx", evt.Path);
+        Assert.Equal(1400000, evt.BytesSent);
+        Assert.Equal(2100000, evt.TotalBytes);
+        Assert.Equal(1, evt.Thread);
+    }
+
+    [Fact]
+    public void TryParse_CompleteEvent()
+    {
+        var evt = ProgressEvent.TryParse("{\"event\":\"complete\",\"files_transferred\":10,\"files_deleted\":2,\"bytes\":89700000,\"elapsed_ms\":5200,\"exit_code\":0}");
+        Assert.NotNull(evt);
+        Assert.Equal(10, evt.FilesTransferred);
+        Assert.Equal(2, evt.FilesDeleted);
+        Assert.Equal(0, evt.ExitCode);
+    }
+
+    [Fact]
+    public void TryParse_ErrorEvent()
+    {
+        var evt = ProgressEvent.TryParse("{\"event\":\"error\",\"message\":\"Connection refused\",\"fatal\":true}");
+        Assert.NotNull(evt);
+        Assert.Equal("error", evt.Event);
+        Assert.Equal("Connection refused", evt.Message);
+        Assert.True(evt.Fatal);
+    }
+
+    [Fact]
+    public void TryParse_InvalidJson_ReturnsNull()
+    {
+        var evt = ProgressEvent.TryParse("not json at all");
+        Assert.Null(evt);
+    }
+
+    [Fact]
+    public void TryParse_DeleteEvent()
+    {
+        var evt = ProgressEvent.TryParse("{\"event\":\"delete\",\"path\":\"docs/old.docx\",\"backed_up\":true,\"success\":true}");
+        Assert.NotNull(evt);
+        Assert.Equal("delete", evt.Event);
+        Assert.True(evt.BackedUp);
+        Assert.True(evt.Success);
+    }
+}
+```
+
+- [ ] **Step 6: Verify all tests pass**
+
+Run: `dotnet test`
+Expected: All tests pass.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add tests/ExecRFS.Tests/
+git commit -m "test: add ExecRFS unit tests for CommandBuilder, ProfileService, LogAggregator, ProgressEvent"
+```
+
+---
+
+## Task 15: Final Build Verification and Push
 
 - [ ] **Step 1: Build entire solution**
 
@@ -2353,8 +2868,28 @@ git push -u origin feature/execrfs-ui
 
 | Check | Result |
 |-------|--------|
-| All spec sections covered? | Yes — JSON protocol (T2-5), Project scaffold (T6), Models (T7), Services (T8-9), CSS (T10), Layout (T11), Components (T12-13) |
+| All spec sections covered? | Yes — JSON protocol (T2-5), Scaffold (T6), Models (T7), Services (T8-9), CSS (T10), Layout (T11), Components (T12-13), Tests (T14) |
 | No TBD/TODO? | Yes — all code is complete |
-| Type names consistent? | `SyncProfile`, `SyncInstanceState`, `ProgressEvent`, `ProcessManager`, `ProfileService`, `CommandBuilder`, `LogAggregator` — consistent across all tasks |
-| Method signatures match? | `ProcessManager.Start(SyncProfile)` used in panels matches definition in T9 |
-| Spec requirements covered? | Start/Stop/Pause ✓, Generate CMD ✓, Live log ✓, Per-thread progress ✓, Profiles ✓, Dark theme ✓ |
+| Type names consistent? | `SyncProfile`, `SyncInstanceState`, `ProgressEvent`, `ProcessManager`, `SyncProcesses`, `ProfileService`, `CommandBuilder`, `LogAggregator` — consistent |
+| Method signatures match? | `ProcessManager.Start(SyncProfile)` used in panels matches definition in T9. `SyncProcesses.Server`/`.Client` used in MainLayout matches T6 |
+| DI consistent? | `SyncProcesses` registered once, injected via `@inject SyncProcesses` — no duplicate registrations |
+| Spec requirements covered? | Start/Stop/Pause ✓, Generate CMD (with Copy Server/Client/Both) ✓, Live log (with JS auto-scroll) ✓, Per-thread progress ✓, Profiles (Save/Load/Delete) ✓, Dark theme ✓ |
+| Build correctness? | csproj has UseWindowsForms ✓, xmlns:layout declared ✓, FolderPicker uses SelectedPath ✓, PatternList creates new list ✓ |
+| Tests complete? | Phase A: JsonProgressWriter (T2), StdinCommandReader (T3). Phase B: CommandBuilder, ProfileService, LogAggregator, ProgressEvent (T14) |
+
+## Review Fixes Applied
+
+| Issue | Fix |
+|-------|-----|
+| Missing UseWindowsForms in csproj | Added `<UseWindowsForms>true</UseWindowsForms>` + explicit wwwroot content include |
+| DI dual-singleton collision | Replaced with `SyncProcesses` holder class registered once |
+| Missing xmlns:layout in XAML | Added `xmlns:layout="clr-namespace:ExecRFS.Components.Layout"` |
+| Task 5 too vague | Added concrete code for every JSON event insertion point |
+| 9 missing ExecRFS tests | Added Task 14 with full test project and 19 test methods |
+| FolderBrowserDialog.InitialDirectory | Changed to `dialog.SelectedPath` |
+| PatternList mutates [Parameter] | Creates new `List<string>` before invoking callback |
+| LogViewer no auto-scroll | Added `IJSRuntime` injection + `scrollToBottom` JS interop in `OnAfterRenderAsync` |
+| ProgressBar byte tracking | Added `_bytesForCompletedFiles` accumulator + `_bytesForCurrentFile` per-file |
+| CommandPreview missing buttons | Added Copy Server / Copy Client / Copy Both with JS clipboard interop |
+| ProfileManager missing Delete | Added Delete button to toolbar with confirmation |
+| ProgressBar/LogViewer Dispose | Added `IDisposable` with timer disposal and event unsubscription |
