@@ -1,0 +1,101 @@
+@* ServerPanel — configure and control the RFS server process *@
+
+<div class="panel">
+    <div class="panel-header">
+        <span class="panel-title server">Server</span>
+        <span style="display:flex; align-items:center; gap:6px; font-size:11px;">
+            <span class="status-dot @DotClass"></span>
+            <span style="color:var(--muted);">@ProcessManager.State</span>
+        </span>
+    </div>
+
+    @* Folder *@
+    <FolderPicker Label="Sync Folder"
+                  Value="@Profile.ServerFolder"
+                  ValueChanged="@(v => Profile.ServerFolder = v ?? "")"
+                  Placeholder="C:\path\to\folder" />
+
+    @* Port *@
+    <div class="field">
+        <div class="field-label">Port</div>
+        <input type="number" min="1" max="65535"
+               value="@Profile.ServerPort"
+               @onchange="e => Profile.ServerPort = int.TryParse(e.Value?.ToString(), out var p) ? p : 15782" />
+    </div>
+
+    @* Backup Folder *@
+    <FolderPicker Label="Backup Folder (optional)"
+                  Value="@Profile.ServerBackupFolder"
+                  ValueChanged="@(v => Profile.ServerBackupFolder = v)"
+                  Placeholder="Leave empty to disable backups" />
+
+    @* Block Size + Max Threads *@
+    <div class="field-grid" style="margin-bottom:8px;">
+        <div class="field">
+            <div class="field-label">Block Size</div>
+            <select value="@Profile.ServerBlockSize"
+                    @onchange="e => Profile.ServerBlockSize = int.TryParse(e.Value?.ToString(), out var v) ? v : 65536">
+                <option value="16384">16 KB</option>
+                <option value="32768">32 KB</option>
+                <option value="65536">64 KB (default)</option>
+                <option value="131072">128 KB</option>
+                <option value="262144">256 KB</option>
+            </select>
+        </div>
+        <div class="field">
+            <div class="field-label">Max Threads</div>
+            <select value="@Profile.ServerMaxThreads"
+                    @onchange="e => Profile.ServerMaxThreads = int.TryParse(e.Value?.ToString(), out var v) ? v : 1">
+                @for (int i = 1; i <= 8; i++)
+                {
+                    var val = i;
+                    <option value="@val">@val</option>
+                }
+            </select>
+        </div>
+    </div>
+
+    @* Include / Exclude patterns *@
+    <PatternList Label="Include Patterns"
+                 Patterns="@Profile.IncludePatterns"
+                 PatternsChanged="@(v => Profile.IncludePatterns = v)"
+                 Type="include" />
+
+    <PatternList Label="Exclude Patterns"
+                 Patterns="@Profile.ExcludePatterns"
+                 PatternsChanged="@(v => Profile.ExcludePatterns = v)"
+                 Type="exclude" />
+
+    @* Controls *@
+    <div style="display:flex; gap:6px; margin-top:8px;">
+        @if (ProcessManager.State == SyncInstanceState.Idle ||
+             ProcessManager.State == SyncInstanceState.Stopped ||
+             ProcessManager.State == SyncInstanceState.Error)
+        {
+            <button class="btn btn-start" @onclick="Start">Start Server</button>
+        }
+        else
+        {
+            <button class="btn btn-stop" @onclick="Stop"
+                    disabled="@(ProcessManager.State == SyncInstanceState.Stopping)">Stop</button>
+        }
+    </div>
+</div>
+
+@code {
+    [Parameter] public SyncProfile Profile { get; set; } = null!;
+    [Parameter] public ProcessManager ProcessManager { get; set; } = null!;
+
+    private string DotClass => ProcessManager.State switch
+    {
+        SyncInstanceState.Running  => "running",
+        SyncInstanceState.Paused   => "paused",
+        SyncInstanceState.Error    => "error",
+        SyncInstanceState.Starting => "syncing",
+        SyncInstanceState.Stopping => "syncing",
+        _                          => "idle"
+    };
+
+    private void Start() => ProcessManager.Start(Profile);
+    private void Stop()  => ProcessManager.Stop();
+}
