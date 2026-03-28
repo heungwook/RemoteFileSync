@@ -1,0 +1,191 @@
+@inject ProfileService ProfileService
+@inject SyncProcesses SyncProcs
+@inject LogAggregator LogAgg
+@inject IJSRuntime JS
+@implements IDisposable
+
+<div class="main-layout">
+    @* ── Toolbar ── *@
+    <div class="toolbar">
+        <span class="app-name">ExecRFS</span>
+
+        <select style="width:180px" @onchange="OnProfileSelected">
+            <option value="">— select profile —</option>
+            @foreach (var name in _profiles)
+            {
+                <option value="@name" selected="@(name == ProfileService.CurrentProfile.Name)">@name</option>
+            }
+        </select>
+
+        <button class="btn" @onclick="SaveProfile">Save</button>
+        <button class="btn" @onclick="() => _showSaveAs = true">Save As…</button>
+        <button class="btn" @onclick="DeleteProfile">Delete</button>
+        <button class="btn" @onclick="GenerateCommand">Generate CMD</button>
+    </div>
+
+    @* ── Split panels ── *@
+    <div class="split-panels" style="flex:1; overflow:hidden;">
+        <ServerPanel Profile="ProfileService.CurrentProfile"
+                     ProcessManager="SyncProcs.Server" />
+        <ClientPanel Profile="ProfileService.CurrentProfile"
+                     ProcessManager="SyncProcs.Client" />
+    </div>
+
+    @* ── Progress bar ── *@
+    <ProgressBar ServerProcess="SyncProcs.Server" ClientProcess="SyncProcs.Client" />
+
+    @* ── Log viewer ── *@
+    <LogViewer Aggregator="LogAgg" />
+</div>
+
+@* ── Save As dialog ── *@
+@if (_showSaveAs)
+{
+    <div class="modal-overlay" @onclick="() => _showSaveAs = false">
+        <div class="modal-box" @onclick:stopPropagation="true">
+            <div style="font-weight:bold; margin-bottom:10px;">Save Profile As</div>
+            <input class="field-input" type="text" placeholder="Profile name"
+                   @bind="_saveAsName" @bind:event="oninput"
+                   @onkeydown="OnSaveAsKeyDown" />
+            <div style="display:flex; gap:8px; margin-top:10px; justify-content:flex-end;">
+                <button class="btn" @onclick="() => _showSaveAs = false">Cancel</button>
+                <button class="btn btn-start" @onclick="ConfirmSaveAs">Save</button>
+            </div>
+        </div>
+    </div>
+}
+
+@* ── Command Preview dialog ── *@
+@if (_showCommandPreview)
+{
+    <div class="modal-overlay" @onclick="() => _showCommandPreview = false">
+        <div class="modal-box" style="width:700px; max-width:95vw;" @onclick:stopPropagation="true">
+            <div style="font-weight:bold; margin-bottom:10px;">Generated Commands</div>
+
+            <div style="margin-bottom:8px;">
+                <div class="field-label">Server Command</div>
+                <pre class="cmd-preview">@_serverCmd</pre>
+            </div>
+            <div style="margin-bottom:10px;">
+                <div class="field-label">Client Command</div>
+                <pre class="cmd-preview">@_clientCmd</pre>
+            </div>
+
+            <div style="display:flex; gap:8px; justify-content:flex-end;">
+                <button class="btn" @onclick="() => CopyCmd(_serverCmd)">Copy Server</button>
+                <button class="btn" @onclick="() => CopyCmd(_clientCmd)">Copy Client</button>
+                <button class="btn" @onclick="CopyBoth">Copy Both</button>
+                <button class="btn" @onclick="() => _showCommandPreview = false">Close</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private List<string> _profiles = new();
+    private bool _showSaveAs;
+    private string _saveAsName = "";
+    private bool _showCommandPreview;
+    private string _serverCmd = "";
+    private string _clientCmd = "";
+
+    protected override void OnInitialized()
+    {
+        _profiles = ProfileService.ListProfiles();
+
+        SyncProcs.Server.OnLogLine += line => { LogAgg.AddLine("SRV", line); InvokeAsync(StateHasChanged); };
+        SyncProcs.Client.OnLogLine += line => { LogAgg.AddLine("CLI", line); InvokeAsync(StateHasChanged); };
+        SyncProcs.Server.OnStateChanged += _ => InvokeAsync(StateHasChanged);
+        SyncProcs.Client.OnStateChanged += _ => InvokeAsync(StateHasChanged);
+    }
+
+    private void OnProfileSelected(ChangeEventArgs e)
+    {
+        var name = e.Value?.ToString();
+        if (string.IsNullOrEmpty(name)) return;
+        try
+        {
+            ProfileService.CurrentProfile = ProfileService.Load(name);
+            StateHasChanged();
+        }
+        catch { }
+    }
+
+    private void SaveProfile()
+    {
+        ProfileService.Save(ProfileService.CurrentProfile);
+        _profiles = ProfileService.ListProfiles();
+    }
+
+    private async Task ConfirmSaveAs()
+    {
+        var name = _saveAsName.Trim();
+        if (string.IsNullOrEmpty(name)) return;
+        ProfileService.CurrentProfile.Name = name;
+        ProfileService.Save(ProfileService.CurrentProfile);
+        _profiles = ProfileService.ListProfiles();
+        _showSaveAs = false;
+        _saveAsName = "";
+        await Task.CompletedTask;
+    }
+
+    private void DeleteProfile()
+    {
+        var name = ProfileService.CurrentProfile.Name;
+        if (string.IsNullOrEmpty(name) || name == "Untitled") return;
+        ProfileService.Delete(name);
+        ProfileService.CurrentProfile = new();
+        _profiles = ProfileService.ListProfiles();
+    }
+
+    private void GenerateCommand()
+    {
+        _serverCmd = CommandBuilder.Build(ProfileService.CurrentProfile, isServer: true);
+        _clientCmd = CommandBuilder.Build(ProfileService.CurrentProfile, isServer: false);
+        _showCommandPreview = true;
+    }
+
+    private async Task CopyCmd(string text)
+        => await JS.InvokeVoidAsync("copyToClipboard", text);
+
+    private async Task CopyBoth()
+        => await JS.InvokeVoidAsync("copyToClipboard", _serverCmd + "\n\n" + _clientCmd);
+
+    private async Task OnSaveAsKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await ConfirmSaveAs();
+        else if (e.Key == "Escape") _showSaveAs = false;
+    }
+
+    public void Dispose()
+    {
+        // ProcessManager events fire on background threads; no explicit unsubscribe needed
+        // as the layout lives for the app's entire lifetime.
+    }
+}
+
+<style>
+    .modal-overlay {
+        position: fixed; inset: 0;
+        background: rgba(0,0,0,.6);
+        display: flex; align-items: center; justify-content: center;
+        z-index: 1000;
+    }
+    .modal-box {
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: 8px; padding: 20px; min-width: 320px;
+    }
+    .cmd-preview {
+        background: #010409; border: 1px solid var(--border);
+        border-radius: 4px; padding: 8px; font-size: 11px;
+        font-family: 'Cascadia Code', 'Consolas', monospace;
+        white-space: pre-wrap; word-break: break-all;
+        color: var(--text); margin: 0;
+    }
+    .field-input {
+        background: var(--surface); border: 1px solid var(--border);
+        padding: 5px 8px; border-radius: 4px; color: var(--text);
+        font-size: 13px; width: 100%;
+    }
+    .field-input:focus { outline: none; border-color: var(--blue); }
+</style>
