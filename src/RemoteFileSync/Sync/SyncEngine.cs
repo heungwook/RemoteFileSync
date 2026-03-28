@@ -89,6 +89,123 @@ public static class SyncEngine
         return plan;
     }
 
+    public static List<SyncPlanEntry> ComputePlan(
+        FileManifest clientManifest,
+        FileManifest serverManifest,
+        bool bidirectional,
+        SyncDatabase? db,
+        bool deleteEnabled)
+    {
+        var plan = new List<SyncPlanEntry>();
+        var deletionHandled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Collect all paths: both manifests + DB tracked files with status='exists'
+        var allPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in clientManifest.AllPaths) allPaths.Add(path);
+        foreach (var path in serverManifest.AllPaths) allPaths.Add(path);
+        if (deleteEnabled && db != null)
+        {
+            foreach (var fs in db.GetAllTrackedFiles())
+            {
+                if (fs.Status == "exists")
+                    allPaths.Add(fs.Path);
+            }
+        }
+
+        foreach (var path in allPaths.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+        {
+            var clientEntry = clientManifest.Get(path);
+            var serverEntry = serverManifest.Get(path);
+
+            if (clientEntry != null && serverEntry != null)
+            {
+                // Both sides have the file — normal conflict resolution
+                var action = ConflictResolver.Resolve(clientEntry, serverEntry);
+                plan.Add(new SyncPlanEntry(action, path));
+            }
+            else if (clientEntry != null && serverEntry == null)
+            {
+                // Client has, server doesn't
+                if (deleteEnabled && db != null)
+                {
+                    var dbState = db.GetFileState(path);
+                    if (dbState == null)
+                    {
+                        // Genuinely new — ClientOnly
+                        plan.Add(new SyncPlanEntry(SyncActionType.ClientOnly, path));
+                    }
+                    else if (dbState.Status == "exists")
+                    {
+                        // Server deleted it
+                        if (bidirectional)
+                        {
+                            var action = ConflictResolver.ResolveDeleteConflict(
+                                deletedOnClient: false, clientEntry, dbState.LastSynced);
+                            plan.Add(new SyncPlanEntry(action, path));
+                        }
+                        else
+                        {
+                            // Bug #4 fix: uni-directional, client authoritative — re-push
+                            plan.Add(new SyncPlanEntry(SyncActionType.ClientOnly, path));
+                        }
+                    }
+                    else
+                    {
+                        // dbState.Status == "deleted" or "new" — re-appeared or never synced → ClientOnly
+                        plan.Add(new SyncPlanEntry(SyncActionType.ClientOnly, path));
+                    }
+                }
+                else
+                {
+                    // No DB — ClientOnly
+                    plan.Add(new SyncPlanEntry(SyncActionType.ClientOnly, path));
+                }
+                deletionHandled.Add(path);
+            }
+            else if (clientEntry == null && serverEntry != null)
+            {
+                // Server has, client doesn't
+                if (deleteEnabled && db != null)
+                {
+                    var dbState = db.GetFileState(path);
+                    if (dbState == null)
+                    {
+                        // Genuinely new on server — ServerOnly if bidi
+                        if (bidirectional)
+                            plan.Add(new SyncPlanEntry(SyncActionType.ServerOnly, path));
+                    }
+                    else if (dbState.Status == "exists")
+                    {
+                        // Client deleted it — resolve conflict using per-file timestamp
+                        var action = ConflictResolver.ResolveDeleteConflict(
+                            deletedOnClient: true, serverEntry, dbState.LastSynced);
+                        plan.Add(new SyncPlanEntry(action, path));
+                    }
+                    else
+                    {
+                        // dbState.Status == "deleted" or "new" — re-appeared on server → ServerOnly if bidi
+                        if (bidirectional)
+                            plan.Add(new SyncPlanEntry(SyncActionType.ServerOnly, path));
+                    }
+                }
+                else
+                {
+                    // No DB — ServerOnly if bidi
+                    if (bidirectional)
+                        plan.Add(new SyncPlanEntry(SyncActionType.ServerOnly, path));
+                }
+                deletionHandled.Add(path);
+            }
+            else
+            {
+                // Neither has it (from DB tracked paths) — both deleted, no action
+                deletionHandled.Add(path);
+            }
+        }
+
+        return plan;
+    }
+
     public static FileManifest BuildMergedManifest(
         FileManifest clientManifest,
         FileManifest serverManifest,
