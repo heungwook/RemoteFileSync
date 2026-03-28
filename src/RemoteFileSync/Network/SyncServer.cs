@@ -5,6 +5,7 @@ using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
 using RemoteFileSync.Progress;
+using RemoteFileSync.State;
 using RemoteFileSync.Sync;
 using RemoteFileSync.Transfer;
 
@@ -16,15 +17,18 @@ public sealed class SyncServer
     private readonly SyncLogger _logger;
     private readonly JsonProgressWriter _progress;
     private readonly StdinCommandReader _stdinReader;
+    private readonly SyncDatabase? _db;
 
     public SyncServer(SyncOptions options, SyncLogger logger,
                       JsonProgressWriter? progressWriter = null,
-                      StdinCommandReader? stdinReader = null)
+                      StdinCommandReader? stdinReader = null,
+                      SyncDatabase? db = null)
     {
         _options = options;
         _logger = logger;
         _progress = progressWriter ?? JsonProgressWriter.Null;
         _stdinReader = stdinReader ?? StdinCommandReader.Null;
+        _db = db;
     }
 
     public async Task<int> RunAsync(CancellationToken ct)
