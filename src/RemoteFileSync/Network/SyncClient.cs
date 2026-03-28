@@ -144,7 +144,16 @@ public sealed class SyncClient
         if (_db != null)
         {
             foreach (var skip in syncPlan.Where(p => p.Action == SyncActionType.Skip))
-                _db.MarkSkipped(skip.RelativePath, sessionId);
+            {
+                // Use client manifest entry (or server as fallback) to record in files table so
+                // deletion can be detected on the next run.
+                var entry = clientManifest.Get(skip.RelativePath)
+                         ?? serverManifest.Get(skip.RelativePath);
+                if (entry != null)
+                    _db.MarkSynced(skip.RelativePath, entry.FileSize, entry.LastModifiedUtc, sessionId, "skipped");
+                else
+                    _db.MarkSkipped(skip.RelativePath, sessionId);
+            }
         }
 
         var backup = new BackupManager(_options.Folder, _options.EffectiveBackupFolder);
