@@ -31,6 +31,9 @@ public record SyncSessionEntry(
     int FilesSkipped,
     int? ExitCode);
 
+/// <summary>
+/// SQLite-backed file state tracking. NOT thread-safe — use from a single thread only.
+/// </summary>
 public sealed class SyncDatabase : IDisposable
 {
     private readonly SqliteConnection _conn;
@@ -296,7 +299,12 @@ UPDATE files SET status = 'deleted', last_synced = $synced
 WHERE path = $path COLLATE NOCASE;";
             upd.Parameters.AddWithValue("$synced", DateTime.UtcNow.Ticks);
             upd.Parameters.AddWithValue("$path", path);
-            upd.ExecuteNonQuery();
+            var rowsAffected = upd.ExecuteNonQuery();
+            if (rowsAffected == 0)
+            {
+                txn.Rollback();
+                return; // Path not tracked — nothing to delete
+            }
 
             using var ver = _conn.CreateCommand();
             ver.Transaction = txn;
@@ -332,8 +340,12 @@ VALUES ($path, 'skipped', NULL, NULL, $session, NULL, NULL, $ts);";
 
     public void MarkNew(string path, long fileSize, DateTime lastModified, string side)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = @"
+        using var txn = _conn.BeginTransaction();
+        try
+        {
+            using var upsert = _conn.CreateCommand();
+            upsert.Transaction = txn;
+            upsert.CommandText = @"
 INSERT INTO files (path, file_size, last_modified, status, last_synced, side)
 VALUES ($path, $size, $modified, 'new', $synced, $side)
 ON CONFLICT(path) DO UPDATE SET
@@ -342,12 +354,32 @@ ON CONFLICT(path) DO UPDATE SET
     status        = 'new',
     last_synced   = excluded.last_synced,
     side          = excluded.side;";
-        cmd.Parameters.AddWithValue("$path", path);
-        cmd.Parameters.AddWithValue("$size", fileSize);
-        cmd.Parameters.AddWithValue("$modified", lastModified.ToUniversalTime().Ticks);
-        cmd.Parameters.AddWithValue("$synced", DateTime.UtcNow.Ticks);
-        cmd.Parameters.AddWithValue("$side", side);
-        cmd.ExecuteNonQuery();
+            upsert.Parameters.AddWithValue("$path", path);
+            upsert.Parameters.AddWithValue("$size", fileSize);
+            upsert.Parameters.AddWithValue("$modified", lastModified.ToUniversalTime().Ticks);
+            upsert.Parameters.AddWithValue("$synced", DateTime.UtcNow.Ticks);
+            upsert.Parameters.AddWithValue("$side", side);
+            upsert.ExecuteNonQuery();
+
+            // Use session id 0 as a sentinel for discovery events (no active sync session)
+            using var ver = _conn.CreateCommand();
+            ver.Transaction = txn;
+            ver.CommandText = @"
+INSERT INTO file_versions (path, action, file_size, last_modified, sync_session_id, direction, detail, timestamp)
+VALUES ($path, 'created', $size, $modified, 0, NULL, NULL, $ts);";
+            ver.Parameters.AddWithValue("$path", path);
+            ver.Parameters.AddWithValue("$size", fileSize);
+            ver.Parameters.AddWithValue("$modified", lastModified.ToUniversalTime().Ticks);
+            ver.Parameters.AddWithValue("$ts", DateTime.UtcNow.Ticks);
+            ver.ExecuteNonQuery();
+
+            txn.Commit();
+        }
+        catch
+        {
+            txn.Rollback();
+            throw;
+        }
     }
 
     // ── History ───────────────────────────────────────────────────────────────

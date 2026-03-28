@@ -210,6 +210,26 @@ public sealed class SyncDatabaseTests : IDisposable
         Assert.Equal(path1, path2);
     }
 
+    // Issue 10: MarkDeleted on a path that was never tracked must not create phantom history
+    [Fact]
+    public void MarkDeleted_NonexistentPath_NoPhantomHistory()
+    {
+        var s = _db.StartSession("bidi", @"C:\Sync", "localhost", 15782);
+        _db.MarkDeleted("nonexistent.txt", s, "should not create history");
+        var history = _db.GetFileHistory("nonexistent.txt");
+        Assert.Empty(history);
+    }
+
+    // Issue 11: MarkNew must write a 'created' version-history entry
+    [Fact]
+    public void MarkNew_CreatesVersionEntry()
+    {
+        _db.MarkNew("discovered.txt", 500, DateTime.UtcNow, "client");
+        var history = _db.GetFileHistory("discovered.txt").ToList();
+        Assert.Single(history);
+        Assert.Equal("created", history[0].Action);
+    }
+
     // 15. Mark synced → deleted → synced again, verify status='exists' + 3 history entries
     [Fact]
     public void PreviouslyDeleted_Reappeared_CanBeMarkedExists()
