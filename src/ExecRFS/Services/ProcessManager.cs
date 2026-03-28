@@ -91,12 +91,8 @@ public sealed class ProcessManager : IDisposable
 
     private static string ResolveExePath()
     {
-        // 1. Same directory as ExecRFS.exe (production: published single-file)
+        // 1. Development: sibling project build output (checked first — most common during dev)
         var appDir = AppDomain.CurrentDomain.BaseDirectory;
-        var local = Path.Combine(appDir, "RemoteFileSync.exe");
-        if (File.Exists(local)) return local;
-
-        // 2. Development: sibling project build output (dotnet build produces exe+dll here)
         var devPaths = new[]
         {
             Path.GetFullPath(Path.Combine(appDir, @"..\..\..\..\RemoteFileSync\bin\Debug\net10.0\win-x64\RemoteFileSync.exe")),
@@ -104,18 +100,38 @@ public sealed class ProcessManager : IDisposable
         };
         foreach (var devPath in devPaths)
         {
-            if (File.Exists(devPath)) return devPath;
+            if (IsValidExe(devPath)) return devPath;
         }
+
+        // 2. Same directory as ExecRFS.exe (production: published single-file)
+        var local = Path.Combine(appDir, "RemoteFileSync.exe");
+        if (IsValidExe(local)) return local;
 
         // 3. PATH
         foreach (var dir in Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator) ?? [])
         {
             var candidate = Path.Combine(dir, "RemoteFileSync.exe");
-            if (File.Exists(candidate)) return candidate;
+            if (IsValidExe(candidate)) return candidate;
         }
 
         throw new FileNotFoundException(
             "RemoteFileSync.exe not found. Build RemoteFileSync first, or place it alongside ExecRFS.exe, or add to PATH.");
+    }
+
+    /// <summary>
+    /// Checks that the exe exists and its companion .dll is also present
+    /// (required for non-single-file builds from dotnet build).
+    /// For published single-file builds, the dll is embedded so only the exe needs to exist.
+    /// </summary>
+    private static bool IsValidExe(string exePath)
+    {
+        if (!File.Exists(exePath)) return false;
+        // Check for companion dll (non-single-file build)
+        var dllPath = Path.ChangeExtension(exePath, ".dll");
+        if (File.Exists(dllPath)) return true;
+        // No dll = might be a published single-file exe — check size > 1MB as heuristic
+        var fi = new FileInfo(exePath);
+        return fi.Length > 1_000_000;
     }
 
     public void Dispose()
