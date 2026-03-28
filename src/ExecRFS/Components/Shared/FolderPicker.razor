@@ -1,0 +1,48 @@
+@* FolderPicker — opens a Windows FolderBrowserDialog on an STA thread *@
+
+<div class="field">
+    <div class="field-label">@Label</div>
+    <div class="field-row">
+        <input type="text" value="@Value" placeholder="@Placeholder"
+               @oninput="OnTextInput" />
+        <button class="btn" style="white-space:nowrap" @onclick="BrowseAsync">Browse…</button>
+    </div>
+</div>
+
+@code {
+    [Parameter] public string Label { get; set; } = "";
+    [Parameter] public string? Value { get; set; }
+    [Parameter] public EventCallback<string?> ValueChanged { get; set; }
+    [Parameter] public string Placeholder { get; set; } = "";
+
+    private async Task OnTextInput(ChangeEventArgs e)
+        => await ValueChanged.InvokeAsync(e.Value?.ToString());
+
+    private async Task BrowseAsync()
+    {
+        string? selected = null;
+        var tcs = new TaskCompletionSource<string?>();
+
+        var thread = new System.Threading.Thread(() =>
+        {
+            var dialog = new System.Windows.Forms.FolderBrowserDialog
+            {
+                Description = Label,
+                UseDescriptionForTitle = true,
+                ShowNewFolderButton = true
+            };
+            if (!string.IsNullOrEmpty(Value))
+                dialog.SelectedPath = Value;
+
+            var result = dialog.ShowDialog();
+            tcs.SetResult(result == System.Windows.Forms.DialogResult.OK
+                ? dialog.SelectedPath : null);
+        });
+        thread.SetApartmentState(System.Threading.ApartmentState.STA);
+        thread.Start();
+
+        selected = await tcs.Task;
+        if (selected != null)
+            await ValueChanged.InvokeAsync(selected);
+    }
+}

@@ -1,0 +1,154 @@
+@implements IDisposable
+
+<div class="progress-section">
+    <div style="display:flex; justify-content:space-between; align-items:center; font-size:11px; color:var(--muted);">
+        <span>
+            @if (_totalFiles > 0)
+            {
+                <span>@_filesCompleted / @_totalFiles files</span>
+                <span style="margin-left:12px;">@FormatBytes(_bytesForCompletedFiles + _bytesForCurrentFile) / @FormatBytes(_totalBytes)</span>
+            }
+            else
+            {
+                <span>Idle</span>
+            }
+        </span>
+        <span>@FormatElapsed()</span>
+        <span>@_percent%</span>
+    </div>
+    <div class="progress-bar-track">
+        <div class="progress-bar-fill" style="width:@(_percent)%"></div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public ProcessManager ServerProcess { get; set; } = null!;
+    [Parameter] public ProcessManager ClientProcess { get; set; } = null!;
+
+    private int _filesCompleted;
+    private int _totalFiles;
+    private long _bytesForCompletedFiles;
+    private long _bytesForCurrentFile;
+    private long _totalBytes;
+    private DateTime? _startTime;
+    private TimeSpan _elapsed = TimeSpan.Zero;
+    private int _percent;
+
+    private System.Timers.Timer? _timer;
+
+    // Per-file byte tracking: thread -> bytes of in-progress file
+    private readonly Dictionary<int, long> _threadCurrentBytes = new();
+
+    protected override void OnInitialized()
+    {
+        ServerProcess.OnProgress += HandleProgress;
+        ClientProcess.OnProgress += HandleProgress;
+        ServerProcess.OnStateChanged += HandleStateChange;
+        ClientProcess.OnStateChanged += HandleStateChange;
+
+        _timer = new System.Timers.Timer(500);
+        _timer.Elapsed += (_, _) =>
+        {
+            if (_startTime.HasValue)
+            {
+                _elapsed = DateTime.Now - _startTime.Value;
+                InvokeAsync(StateHasChanged);
+            }
+        };
+        _timer.Start();
+    }
+
+    private void HandleStateChange(SyncInstanceState state)
+    {
+        if (state == SyncInstanceState.Running && _startTime == null)
+        {
+            _startTime = DateTime.Now;
+            _filesCompleted = 0;
+            _totalFiles = 0;
+            _bytesForCompletedFiles = 0;
+            _bytesForCurrentFile = 0;
+            _totalBytes = 0;
+            _threadCurrentBytes.Clear();
+        }
+        else if (state == SyncInstanceState.Stopped || state == SyncInstanceState.Error)
+        {
+            _startTime = null;
+        }
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleProgress(ProgressEvent evt)
+    {
+        switch (evt.Event)
+        {
+            case "scan_complete":
+                _totalFiles = evt.Files ?? _totalFiles;
+                _totalBytes = evt.Bytes ?? _totalBytes;
+                break;
+
+            case "file_start":
+                if (evt.Thread.HasValue && evt.Size.HasValue)
+                    _threadCurrentBytes[evt.Thread.Value] = 0;
+                break;
+
+            case "progress":
+                if (evt.Thread.HasValue && evt.BytesSent.HasValue)
+                {
+                    _threadCurrentBytes[evt.Thread.Value] = evt.BytesSent.Value;
+                    _bytesForCurrentFile = _threadCurrentBytes.Values.Sum();
+                }
+                break;
+
+            case "file_end":
+                if (evt.Thread.HasValue)
+                {
+                    if (_threadCurrentBytes.TryGetValue(evt.Thread.Value, out var fileBytes))
+                        _bytesForCompletedFiles += fileBytes;
+                    else if (evt.Size.HasValue)
+                        _bytesForCompletedFiles += evt.Size.Value;
+                    _threadCurrentBytes.Remove(evt.Thread.Value);
+                    _bytesForCurrentFile = _threadCurrentBytes.Values.Sum();
+                }
+                _filesCompleted++;
+                break;
+
+            case "complete":
+                _filesCompleted = evt.FilesTransferred ?? _filesCompleted;
+                _percent = 100;
+                InvokeAsync(StateHasChanged);
+                return;
+        }
+
+        _percent = _totalBytes > 0
+            ? (int)((_bytesForCompletedFiles + _bytesForCurrentFile) * 100 / _totalBytes)
+            : 0;
+        _percent = Math.Clamp(_percent, 0, 100);
+        InvokeAsync(StateHasChanged);
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024L * 1024 * 1024) return $"{bytes / 1024.0 / 1024:F1} MB";
+        return $"{bytes / 1024.0 / 1024 / 1024:F2} GB";
+    }
+
+    private string FormatElapsed()
+    {
+        if (_elapsed == TimeSpan.Zero) return "";
+        if (_elapsed.TotalHours >= 1) return $"{(int)_elapsed.TotalHours}h {_elapsed.Minutes:D2}m {_elapsed.Seconds:D2}s";
+        if (_elapsed.TotalMinutes >= 1) return $"{_elapsed.Minutes}m {_elapsed.Seconds:D2}s";
+        return $"{_elapsed.Seconds}s";
+    }
+
+    public void Dispose()
+    {
+        ServerProcess.OnProgress -= HandleProgress;
+        ClientProcess.OnProgress -= HandleProgress;
+        ServerProcess.OnStateChanged -= HandleStateChange;
+        ClientProcess.OnStateChanged -= HandleStateChange;
+        _timer?.Stop();
+        _timer?.Dispose();
+    }
+}

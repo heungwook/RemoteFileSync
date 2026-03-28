@@ -1,0 +1,207 @@
+@* ClientPanel — configure and control the RFS client process *@
+@implements IDisposable
+
+<div class="panel">
+    <div class="panel-header">
+        <span class="panel-title client">Client</span>
+        <span style="display:flex; align-items:center; gap:6px; font-size:11px;">
+            <span class="status-dot @DotClass"></span>
+            <span style="color:var(--muted);">@ProcessManager.State</span>
+        </span>
+    </div>
+
+    @* Host *@
+    <div class="field">
+        <div class="field-label">Server Host</div>
+        <input type="text" placeholder="hostname or IP"
+               value="@Profile.ClientHost"
+               @onchange="OnHostChanged" />
+    </div>
+
+    @* Folder *@
+    <FolderPicker Label="Sync Folder"
+                  Value="@Profile.ClientFolder"
+                  ValueChanged="@(v => Profile.ClientFolder = v ?? "")"
+                  Placeholder="C:\path\to\folder" />
+
+    @* Port *@
+    <div class="field">
+        <div class="field-label">Port</div>
+        <input type="number" min="1" max="65535"
+               value="@Profile.ClientPort"
+               @onchange="e => Profile.ClientPort = int.TryParse(e.Value?.ToString(), out var p) ? p : 15782" />
+    </div>
+
+    @* Backup Folder *@
+    <FolderPicker Label="Backup Folder (optional)"
+                  Value="@Profile.ClientBackupFolder"
+                  ValueChanged="@(v => Profile.ClientBackupFolder = v)"
+                  Placeholder="Leave empty to disable backups" />
+
+    @* Bidirectional + Delete *@
+    <div class="checkbox-row">
+        <label class="checkbox-label">
+            <input type="checkbox" checked="@Profile.Bidirectional"
+                   @onchange="e => Profile.Bidirectional = (bool)(e.Value ?? false)" />
+            Bidirectional
+        </label>
+        <label class="checkbox-label">
+            <input type="checkbox" checked="@Profile.DeleteEnabled"
+                   @onchange="e => Profile.DeleteEnabled = (bool)(e.Value ?? false)" />
+            Delete Propagation
+        </label>
+    </div>
+
+    @* Block Size + Max Threads *@
+    <div class="field-grid" style="margin-bottom:8px;">
+        <div class="field">
+            <div class="field-label">Block Size</div>
+            <select value="@Profile.ClientBlockSize"
+                    @onchange="e => Profile.ClientBlockSize = int.TryParse(e.Value?.ToString(), out var v) ? v : 65536">
+                <option value="16384">16 KB</option>
+                <option value="32768">32 KB</option>
+                <option value="65536">64 KB (default)</option>
+                <option value="131072">128 KB</option>
+                <option value="262144">256 KB</option>
+            </select>
+        </div>
+        <div class="field">
+            <div class="field-label">Max Threads</div>
+            <select value="@Profile.ClientMaxThreads"
+                    @onchange="e => Profile.ClientMaxThreads = int.TryParse(e.Value?.ToString(), out var v) ? v : 1">
+                @for (int i = 1; i <= 8; i++)
+                {
+                    var val = i;
+                    <option value="@val">@val</option>
+                }
+            </select>
+        </div>
+    </div>
+
+    @* Include / Exclude patterns *@
+    <PatternList Label="Include Patterns"
+                 Patterns="@Profile.IncludePatterns"
+                 PatternsChanged="@(v => Profile.IncludePatterns = v)"
+                 Type="include" />
+
+    <PatternList Label="Exclude Patterns"
+                 Patterns="@Profile.ExcludePatterns"
+                 PatternsChanged="@(v => Profile.ExcludePatterns = v)"
+                 Type="exclude" />
+
+    @* Per-thread transfer progress *@
+    @if (_activeTransfers.Count > 0)
+    {
+        <div class="thread-progress">
+            <div style="font-size:10px; color:var(--muted); margin-bottom:4px;">Active Transfers</div>
+            @foreach (var kv in _activeTransfers.OrderBy(x => x.Key))
+            {
+                var pct = kv.Value.TotalBytes > 0
+                    ? (int)(kv.Value.BytesSent * 100 / kv.Value.TotalBytes)
+                    : 0;
+                <div>
+                    <div class="thread-row">
+                        <span style="color:var(--muted);">T@(kv.Key)</span>
+                        <span style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                              title="@kv.Value.Path">@System.IO.Path.GetFileName(kv.Value.Path)</span>
+                        <span style="color:var(--muted);">@pct%</span>
+                    </div>
+                    <div class="thread-bar">
+                        <div class="thread-bar-fill" style="width:@(pct)%"></div>
+                    </div>
+                </div>
+            }
+        </div>
+    }
+
+    @* Controls *@
+    <div style="display:flex; gap:6px; margin-top:8px;">
+        @if (ProcessManager.State == SyncInstanceState.Idle ||
+             ProcessManager.State == SyncInstanceState.Stopped ||
+             ProcessManager.State == SyncInstanceState.Error)
+        {
+            <button class="btn btn-start" @onclick="Start">Start Client</button>
+        }
+        else
+        {
+            @if (ProcessManager.State == SyncInstanceState.Running)
+            {
+                <button class="btn btn-pause" @onclick="Pause">Pause</button>
+            }
+            else if (ProcessManager.State == SyncInstanceState.Paused)
+            {
+                <button class="btn btn-start" @onclick="Resume">Resume</button>
+            }
+            <button class="btn btn-stop" @onclick="Stop"
+                    disabled="@(ProcessManager.State == SyncInstanceState.Stopping)">Stop</button>
+        }
+    </div>
+</div>
+
+@code {
+    [Parameter] public SyncProfile Profile { get; set; } = null!;
+    [Parameter] public ProcessManager ProcessManager { get; set; } = null!;
+
+    private readonly Dictionary<int, TransferInfo> _activeTransfers = new();
+    private record TransferInfo(string Path, long BytesSent, long TotalBytes, int Thread);
+
+    protected override void OnInitialized()
+    {
+        ProcessManager.OnProgress += HandleProgress;
+        ProcessManager.OnStateChanged += _ => InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleProgress(ProgressEvent evt)
+    {
+        switch (evt.Event)
+        {
+            case "file_start":
+                if (evt.Thread.HasValue)
+                    _activeTransfers[evt.Thread.Value] =
+                        new TransferInfo(evt.Path ?? "", 0, evt.Size ?? 0, evt.Thread.Value);
+                break;
+
+            case "progress":
+                if (evt.Thread.HasValue && _activeTransfers.TryGetValue(evt.Thread.Value, out var existing))
+                    _activeTransfers[evt.Thread.Value] = existing with
+                    {
+                        BytesSent = evt.BytesSent ?? existing.BytesSent,
+                        TotalBytes = evt.TotalBytes ?? existing.TotalBytes
+                    };
+                break;
+
+            case "file_end":
+                if (evt.Thread.HasValue)
+                    _activeTransfers.Remove(evt.Thread.Value);
+                break;
+
+            case "complete":
+                _activeTransfers.Clear();
+                break;
+        }
+        InvokeAsync(StateHasChanged);
+    }
+
+    private string DotClass => ProcessManager.State switch
+    {
+        SyncInstanceState.Running  => "running",
+        SyncInstanceState.Paused   => "paused",
+        SyncInstanceState.Error    => "error",
+        SyncInstanceState.Starting => "syncing",
+        SyncInstanceState.Stopping => "syncing",
+        _                          => "idle"
+    };
+
+    private void OnHostChanged(ChangeEventArgs e)
+        => Profile.ClientHost = e.Value?.ToString() ?? string.Empty;
+
+    private void Start()  => ProcessManager.Start(Profile);
+    private void Pause()  => ProcessManager.Pause();
+    private void Resume() => ProcessManager.Resume();
+    private void Stop()   => ProcessManager.Stop();
+
+    public void Dispose()
+    {
+        ProcessManager.OnProgress -= HandleProgress;
+    }
+}

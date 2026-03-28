@@ -1,0 +1,72 @@
+@* PatternList — manages include/exclude pattern tags *@
+
+<div class="field">
+    <div class="field-label">@Label</div>
+    <div style="display:flex; flex-wrap:wrap; gap:4px; margin-bottom:4px;">
+        @foreach (var pattern in Patterns)
+        {
+            <span class="tag @TagClass">
+                @pattern
+                <span class="tag-remove" @onclick="@(() => RemovePattern(pattern))" title="Remove">&#x2715;</span>
+            </span>
+        }
+        @if (!_adding)
+        {
+            <span class="tag tag-add" @onclick="StartAdding">+ Add</span>
+        }
+    </div>
+    @if (_adding)
+    {
+        <div class="field-row">
+            <input type="text" placeholder="pattern (e.g. *.txt)"
+                   @bind="_newPattern" @bind:event="oninput"
+                   @onkeydown="OnKeyDown"
+                   style="flex:1" />
+            <button class="btn btn-start" @onclick="AddPattern">Add</button>
+            <button class="btn" @onclick="CancelAdding">Cancel</button>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public string Label { get; set; } = "";
+    [Parameter] public List<string> Patterns { get; set; } = new();
+    [Parameter] public EventCallback<List<string>> PatternsChanged { get; set; }
+    [Parameter] public string Type { get; set; } = "include";  // "include" | "exclude"
+
+    private bool _adding;
+    private string _newPattern = "";
+
+    private string TagClass => Type == "exclude" ? "tag-exclude" : "tag-include";
+
+    private void StartAdding()
+    {
+        _adding = true;
+        _newPattern = "";
+    }
+
+    private void CancelAdding() => _adding = false;
+
+    private async Task AddPattern()
+    {
+        var trimmed = _newPattern.Trim();
+        if (string.IsNullOrEmpty(trimmed)) return;
+        var updated = new List<string>(Patterns) { trimmed };
+        _adding = false;
+        _newPattern = "";
+        await PatternsChanged.InvokeAsync(updated);
+    }
+
+    private async Task RemovePattern(string pattern)
+    {
+        var updated = new List<string>(Patterns);
+        updated.Remove(pattern);
+        await PatternsChanged.InvokeAsync(updated);
+    }
+
+    private async Task OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await AddPattern();
+        else if (e.Key == "Escape") CancelAdding();
+    }
+}

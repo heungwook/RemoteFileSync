@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>ExecRFS</title>
+    <link href="css/app.css" rel="stylesheet" />
+</head>
+<body>
+    <div id="app">Loading...</div>
+    <script>
+        window.scrollToBottom = function(el) {
+            if (el) { el.scrollTop = el.scrollHeight; }
+        };
+        window.copyToClipboard = function(text) {
+            navigator.clipboard.writeText(text);
+        };
+    </script>
+    <script src="_framework/blazor.webview.js"></script>
+</body>
+</html>

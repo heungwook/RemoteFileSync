@@ -8,6 +8,7 @@ public sealed class SyncOptions
     public string Folder { get; set; } = string.Empty;
     public bool Bidirectional { get; set; }
     public bool DeleteEnabled { get; set; }
+    public bool JsonProgress { get; set; }
     public string? BackupFolder { get; set; }
     public List<string> IncludePatterns { get; set; } = new();
     public List<string> ExcludePatterns { get; set; } = new();
