@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/ExecRFS/ExecRFS.csproj" />
     <Project Path="src/RemoteFileSync/RemoteFileSync.csproj" />
   </Folder>
   <Folder Name="/tests/">
