@@ -3,12 +3,14 @@ namespace RemoteFileSync.Logging;
 public sealed class SyncLogger : IDisposable
 {
     private readonly bool _verbose;
+    private readonly bool _suppressConsole;
     private readonly StreamWriter? _logWriter;
     private readonly object _lock = new();
 
-    public SyncLogger(bool verbose, string? logFile)
+    public SyncLogger(bool verbose, string? logFile, bool suppressConsole = false)
     {
         _verbose = verbose;
+        _suppressConsole = suppressConsole;
         if (!string.IsNullOrWhiteSpace(logFile))
         {
             var dir = Path.GetDirectoryName(logFile);
@@ -33,7 +35,7 @@ public sealed class SyncLogger : IDisposable
 
         lock (_lock)
         {
-            if (consoleAlways || _verbose)
+            if (!_suppressConsole && (consoleAlways || _verbose))
                 Console.WriteLine(consoleLine);
             _logWriter?.WriteLine(fileLine);
         }

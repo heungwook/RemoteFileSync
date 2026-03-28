@@ -22,7 +22,8 @@ public class Program
             return 3;
         }
 
-        using var logger = new SyncLogger(options.Verbose, options.LogFile);
+        // When --json-progress is active, suppress ALL console output so stdout is pure JSON
+        using var logger = new SyncLogger(options.Verbose, options.LogFile, suppressConsole: options.JsonProgress);
         logger.Summary($"RemoteFileSync v1.0 — {(options.IsServer ? "Server" : "Client")} mode");
 
         var progressWriter = options.JsonProgress
