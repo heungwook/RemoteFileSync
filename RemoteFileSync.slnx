@@ -4,6 +4,7 @@
     <Project Path="src/RemoteFileSync/RemoteFileSync.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/ExecRFS.Tests/ExecRFS.Tests.csproj" />
     <Project Path="tests/RemoteFileSync.Tests/RemoteFileSync.Tests.csproj" />
   </Folder>
 </Solution>
