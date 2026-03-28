@@ -33,13 +33,28 @@
 
     private string _filter = "all";
     private ElementReference _logContainer;
-
+    private System.Timers.Timer? _refreshTimer;
+    private int _lastRenderedCount;
+    private volatile bool _hasNewEntries;
     private Action<LogEntry>? _entryHandler;
 
     protected override void OnInitialized()
     {
-        _entryHandler = _ => InvokeAsync(StateHasChanged);
+        // Track new entries arriving (lightweight — no re-render)
+        _entryHandler = _ => _hasNewEntries = true;
         Aggregator.OnEntry += _entryHandler;
+
+        // Batch re-render every 5 seconds if new entries exist
+        _refreshTimer = new System.Timers.Timer(5000);
+        _refreshTimer.Elapsed += async (_, _) =>
+        {
+            if (_hasNewEntries)
+            {
+                _hasNewEntries = false;
+                await InvokeAsync(StateHasChanged);
+            }
+        };
+        _refreshTimer.Start();
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -59,6 +74,7 @@
     private void Clear()
     {
         Aggregator.Clear();
+        _hasNewEntries = false;
         StateHasChanged();
     }
 
@@ -85,6 +101,8 @@
 
     public void Dispose()
     {
+        _refreshTimer?.Stop();
+        _refreshTimer?.Dispose();
         if (_entryHandler != null)
             Aggregator.OnEntry -= _entryHandler;
     }
