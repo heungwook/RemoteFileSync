@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
+using RemoteFileSync.Progress;
 using RemoteFileSync.Sync;
 using RemoteFileSync.Transfer;
 
@@ -13,11 +14,17 @@ public sealed class SyncServer
 {
     private readonly SyncOptions _options;
     private readonly SyncLogger _logger;
+    private readonly JsonProgressWriter _progress;
+    private readonly StdinCommandReader _stdinReader;
 
-    public SyncServer(SyncOptions options, SyncLogger logger)
+    public SyncServer(SyncOptions options, SyncLogger logger,
+                      JsonProgressWriter? progressWriter = null,
+                      StdinCommandReader? stdinReader = null)
     {
         _options = options;
         _logger = logger;
+        _progress = progressWriter ?? JsonProgressWriter.Null;
+        _stdinReader = stdinReader ?? StdinCommandReader.Null;
     }
 
     public async Task<int> RunAsync(CancellationToken ct)
@@ -25,11 +32,13 @@ public sealed class SyncServer
         var listener = new TcpListener(IPAddress.Any, _options.Port);
         listener.Start();
         _logger.Summary($"Listening on port {_options.Port}...");
+        _progress.WriteStatus("listening", port: _options.Port);
 
         try
         {
             using var client = await listener.AcceptTcpClientAsync(ct);
             _logger.Summary("Client connected.");
+            _progress.WriteStatus("connected");
             using var stream = client.GetStream();
             return await HandleConnectionAsync(stream, ct);
         }
@@ -64,11 +73,13 @@ public sealed class SyncServer
         var (mType, mData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         var clientManifest = ProtocolHandler.DeserializeManifest(mData);
         _logger.Info($"Client manifest: {clientManifest.Count} files");
+        _progress.WriteManifest("remote", clientManifest.Count, clientManifest.Entries.Sum(e => e.FileSize));
 
         // 4. Scan local folder and send server manifest
         var scanner = new FileScanner(_options.Folder, _options.IncludePatterns, _options.ExcludePatterns);
         var serverManifest = scanner.Scan();
         _logger.Info($"Local manifest: {serverManifest.Count} files");
+        _progress.WriteManifest("local", serverManifest.Count, serverManifest.Entries.Sum(e => e.FileSize));
         var serverManifestBytes = ProtocolHandler.SerializeManifest(serverManifest);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.Manifest, serverManifestBytes, ct);
 
@@ -90,6 +101,8 @@ public sealed class SyncServer
 
         foreach (var action in toReceive)
         {
+            _stdinReader.PauseGate.Wait();
+            if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
             if (action.Action == SyncActionType.SendToServer)
             {
                 if (!backup.BackupFile(action.RelativePath))
@@ -124,6 +137,8 @@ public sealed class SyncServer
             var serverDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnServer).ToList();
             foreach (var del in serverDeletes)
             {
+                _stdinReader.PauseGate.Wait();
+                if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
                 var (delType, delData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
                 if (delType != MessageType.DeleteFile)
                 {
@@ -186,6 +201,8 @@ public sealed class SyncServer
 
             foreach (var action in toSend)
             {
+                _stdinReader.PauseGate.Wait();
+                if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
                 try
                 {
                     short fileId = (short)(filesTransferred % short.MaxValue);
@@ -210,6 +227,8 @@ public sealed class SyncServer
             var clientDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnClient).ToList();
             foreach (var del in clientDeletes)
             {
+                _stdinReader.PauseGate.Wait();
+                if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
                 var payload = ProtocolHandler.SerializeDeleteFile(del.RelativePath, backupFirst: true);
                 await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteFile, payload, ct);
 
@@ -233,11 +252,13 @@ public sealed class SyncServer
 
         // 10. Exchange SyncComplete
         sw.Stop();
+        int exitCode = skippedFiles > 0 ? 1 : 0;
+        _progress.WriteComplete(filesTransferred, filesDeleted, bytesTransferred, sw.ElapsedMilliseconds, exitCode);
         var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, filesDeleted, sw.ElapsedMilliseconds);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
         var (scType, scData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         var deletedSummary = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
         _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedSummary}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
-        return skippedFiles > 0 ? 1 : 0;
+        return exitCode;
     }
 }

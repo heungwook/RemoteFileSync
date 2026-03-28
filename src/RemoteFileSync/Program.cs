@@ -46,7 +46,7 @@ public class Program
         {
             if (options.IsServer)
             {
-                var server = new Network.SyncServer(options, logger);
+                var server = new Network.SyncServer(options, logger, progressWriter, stdinReader);
                 return await server.RunAsync(cts.Token);
             }
             else
@@ -54,7 +54,7 @@ public class Program
                 SyncStateManager? stateManager = null;
                 if (options.DeleteEnabled)
                     stateManager = new SyncStateManager(SyncStateManager.DefaultBaseDir);
-                var client = new Network.SyncClient(options, logger, stateManager);
+                var client = new Network.SyncClient(options, logger, stateManager, progressWriter, stdinReader);
                 return await client.RunAsync(cts.Token);
             }
         }

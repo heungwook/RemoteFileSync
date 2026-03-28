@@ -66,6 +66,7 @@ public sealed class StdinCommandReader : IDisposable
 
     public void Dispose()
     {
+        if (_input == null) return; // Null instance is a shared singleton — never dispose it
         StopToken.Dispose();
         PauseGate.Dispose();
     }
