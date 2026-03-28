@@ -91,14 +91,31 @@ public sealed class ProcessManager : IDisposable
 
     private static string ResolveExePath()
     {
-        var local = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "RemoteFileSync.exe");
+        // 1. Same directory as ExecRFS.exe (production: published single-file)
+        var appDir = AppDomain.CurrentDomain.BaseDirectory;
+        var local = Path.Combine(appDir, "RemoteFileSync.exe");
         if (File.Exists(local)) return local;
+
+        // 2. Development: sibling project build output (dotnet build produces exe+dll here)
+        var devPaths = new[]
+        {
+            Path.GetFullPath(Path.Combine(appDir, @"..\..\..\..\RemoteFileSync\bin\Debug\net10.0\win-x64\RemoteFileSync.exe")),
+            Path.GetFullPath(Path.Combine(appDir, @"..\..\..\..\RemoteFileSync\bin\Release\net10.0\win-x64\RemoteFileSync.exe")),
+        };
+        foreach (var devPath in devPaths)
+        {
+            if (File.Exists(devPath)) return devPath;
+        }
+
+        // 3. PATH
         foreach (var dir in Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator) ?? [])
         {
             var candidate = Path.Combine(dir, "RemoteFileSync.exe");
             if (File.Exists(candidate)) return candidate;
         }
-        throw new FileNotFoundException("RemoteFileSync.exe not found. Place it alongside ExecRFS.exe or add to PATH.");
+
+        throw new FileNotFoundException(
+            "RemoteFileSync.exe not found. Build RemoteFileSync first, or place it alongside ExecRFS.exe, or add to PATH.");
     }
 
     public void Dispose()
