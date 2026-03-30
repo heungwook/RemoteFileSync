@@ -1,0 +1,202 @@
+<h2>ExecRFS — Full Layout Mockup</h2>
+<p class="subtitle">Side-by-side panels with shared progress and log viewer</p>
+
+<div class="mockup">
+  <div class="mockup-header">ExecRFS — RemoteFileSync Manager</div>
+  <div class="mockup-body" style="padding:0;background:#0d1117;">
+
+    <!-- Toolbar -->
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:#161b22;border-bottom:1px solid #30363d;">
+      <div style="color:#4a9eff;font-weight:bold;font-size:13px;">ExecRFS</div>
+      <div style="margin-left:8px;display:flex;gap:4px;">
+        <div style="background:#21262d;border:1px solid #30363d;padding:3px 10px;border-radius:4px;color:#c9d1d9;font-size:11px;">
+          Profile: <strong style="color:#4a9eff;">Work Source Code</strong> ▾
+        </div>
+        <div style="background:#21262d;border:1px solid #30363d;padding:3px 10px;border-radius:4px;color:#c9d1d9;font-size:11px;">Save</div>
+        <div style="background:#21262d;border:1px solid #30363d;padding:3px 10px;border-radius:4px;color:#c9d1d9;font-size:11px;">Save As...</div>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:4px;">
+        <div style="background:#21262d;border:1px solid #30363d;padding:3px 10px;border-radius:4px;color:#c9d1d9;font-size:11px;">Generate CMD</div>
+        <div style="background:#21262d;border:1px solid #30363d;padding:3px 10px;border-radius:4px;color:#8b949e;font-size:11px;">Settings</div>
+      </div>
+    </div>
+
+    <!-- Split Panels -->
+    <div style="display:flex;gap:1px;background:#30363d;">
+
+      <!-- SERVER PANEL -->
+      <div style="flex:1;background:#0d1117;padding:12px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <div style="width:8px;height:8px;border-radius:50%;background:#3fb950;"></div>
+            <span style="color:#4a9eff;font-weight:bold;font-size:13px;">SERVER</span>
+            <span style="color:#3fb950;font-size:10px;">Running</span>
+          </div>
+          <div style="display:flex;gap:4px;">
+            <div style="background:#9a3434;padding:2px 10px;border-radius:3px;color:white;font-size:10px;">Stop</div>
+          </div>
+        </div>
+
+        <div style="font-size:11px;color:#c9d1d9;">
+          <div style="margin-bottom:8px;">
+            <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Sync Folder</div>
+            <div style="display:flex;gap:4px;">
+              <div style="flex:1;background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-family:monospace;font-size:10px;">D:\Production\AppData</div>
+              <div style="background:#21262d;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-size:10px;">Browse</div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
+            <div>
+              <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Port</div>
+              <div style="background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-family:monospace;font-size:10px;">15782</div>
+            </div>
+            <div>
+              <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Backup Folder</div>
+              <div style="display:flex;gap:4px;">
+                <div style="flex:1;background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-family:monospace;font-size:10px;color:#8b949e;">(same as sync)</div>
+              </div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
+            <div>
+              <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Block Size</div>
+              <div style="background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-size:10px;">256 KB ▾</div>
+            </div>
+            <div>
+              <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Max Threads</div>
+              <div style="background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-size:10px;">4 ▾</div>
+            </div>
+          </div>
+          <div style="margin-bottom:6px;">
+            <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Include Patterns</div>
+            <div style="display:flex;flex-wrap:wrap;gap:3px;">
+              <span style="background:#1f3a1f;border:1px solid #2d5a2d;padding:2px 8px;border-radius:10px;font-size:9px;color:#3fb950;">*.cs</span>
+              <span style="background:#1f3a1f;border:1px solid #2d5a2d;padding:2px 8px;border-radius:10px;font-size:9px;color:#3fb950;">*.csproj</span>
+              <span style="background:#21262d;border:1px solid #30363d;padding:2px 8px;border-radius:10px;font-size:9px;color:#8b949e;">+ Add</span>
+            </div>
+          </div>
+          <div style="margin-bottom:6px;">
+            <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Exclude Patterns</div>
+            <div style="display:flex;flex-wrap:wrap;gap:3px;">
+              <span style="background:#3a1f1f;border:1px solid #5a2d2d;padding:2px 8px;border-radius:10px;font-size:9px;color:#f85149;">*.tmp</span>
+              <span style="background:#3a1f1f;border:1px solid #5a2d2d;padding:2px 8px;border-radius:10px;font-size:9px;color:#f85149;">*.bak</span>
+              <span style="background:#21262d;border:1px solid #30363d;padding:2px 8px;border-radius:10px;font-size:9px;color:#8b949e;">+ Add</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CLIENT PANEL -->
+      <div style="flex:1;background:#0d1117;padding:12px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <div style="width:8px;height:8px;border-radius:50%;background:#d29922;animation:pulse 1.5s infinite;"></div>
+            <span style="color:#e88a3a;font-weight:bold;font-size:13px;">CLIENT</span>
+            <span style="color:#d29922;font-size:10px;">Syncing 5/12</span>
+          </div>
+          <div style="display:flex;gap:4px;">
+            <div style="background:#8b5e34;padding:2px 10px;border-radius:3px;color:white;font-size:10px;">Pause</div>
+            <div style="background:#9a3434;padding:2px 10px;border-radius:3px;color:white;font-size:10px;">Stop</div>
+          </div>
+        </div>
+
+        <div style="font-size:11px;color:#c9d1d9;">
+          <div style="margin-bottom:8px;">
+            <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Server Host</div>
+            <div style="background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-family:monospace;font-size:10px;">10.0.1.50</div>
+          </div>
+          <div style="margin-bottom:8px;">
+            <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Sync Folder</div>
+            <div style="display:flex;gap:4px;">
+              <div style="flex:1;background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-family:monospace;font-size:10px;">C:\Production\AppData</div>
+              <div style="background:#21262d;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-size:10px;">Browse</div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
+            <div>
+              <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Port</div>
+              <div style="background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-family:monospace;font-size:10px;">15782</div>
+            </div>
+            <div>
+              <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Backup Folder</div>
+              <div style="display:flex;gap:4px;">
+                <div style="flex:1;background:#161b22;border:1px solid #30363d;padding:4px 8px;border-radius:3px;font-family:monospace;font-size:10px;color:#8b949e;">(same as sync)</div>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:12px;margin-bottom:8px;">
+            <label style="display:flex;align-items:center;gap:4px;font-size:10px;">
+              <div style="width:14px;height:14px;border-radius:3px;background:#4a9eff;display:flex;align-items:center;justify-content:center;color:white;font-size:9px;">✓</div>
+              Bidirectional
+            </label>
+            <label style="display:flex;align-items:center;gap:4px;font-size:10px;">
+              <div style="width:14px;height:14px;border-radius:3px;background:#4a9eff;display:flex;align-items:center;justify-content:center;color:white;font-size:9px;">✓</div>
+              Delete Propagation
+            </label>
+          </div>
+          <div style="margin-bottom:6px;">
+            <div style="color:#8b949e;font-size:9px;text-transform:uppercase;margin-bottom:3px;">Currently Transferring</div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:4px;padding:6px;font-size:9px;">
+              <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+                <span style="color:#e88a3a;">[T1]</span>
+                <span style="color:#c9d1d9;">docs/report.docx</span>
+                <span style="color:#4a9eff;">67%</span>
+              </div>
+              <div style="background:#30363d;border-radius:2px;height:3px;margin-bottom:4px;">
+                <div style="background:#4a9eff;width:67%;height:100%;border-radius:2px;"></div>
+              </div>
+              <div style="display:flex;justify-content:space-between;">
+                <span style="color:#e88a3a;">[T2]</span>
+                <span style="color:#c9d1d9;">data/export.csv</span>
+                <span style="color:#4a9eff;">23%</span>
+              </div>
+              <div style="background:#30363d;border-radius:2px;height:3px;">
+                <div style="background:#4a9eff;width:23%;height:100%;border-radius:2px;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Progress Bar -->
+    <div style="padding:8px 12px;background:#161b22;border-top:1px solid #30363d;">
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#8b949e;margin-bottom:4px;">
+        <span>Overall Progress: <strong style="color:#c9d1d9;">5 of 12 files</strong></span>
+        <span>23.4 MB / 89.7 MB</span>
+        <span style="color:#d29922;">Elapsed: 00:01:23</span>
+      </div>
+      <div style="background:#30363d;border-radius:3px;height:6px;">
+        <div style="background:linear-gradient(90deg,#4a9eff,#3fb950);width:42%;height:100%;border-radius:3px;"></div>
+      </div>
+    </div>
+
+    <!-- Log Viewer -->
+    <div style="background:#010409;padding:8px 12px;font-family:'Cascadia Code',monospace;font-size:10px;line-height:1.6;height:120px;overflow-y:auto;">
+      <div style="display:flex;gap:4px;align-items:center;margin-bottom:6px;">
+        <span style="color:#8b949e;font-size:9px;text-transform:uppercase;">Live Log</span>
+        <div style="margin-left:auto;display:flex;gap:4px;">
+          <span style="background:#21262d;border:1px solid #30363d;padding:1px 8px;border-radius:3px;font-size:9px;color:#8b949e;">Auto-scroll</span>
+          <span style="background:#21262d;border:1px solid #30363d;padding:1px 8px;border-radius:3px;font-size:9px;color:#8b949e;">Clear</span>
+          <span style="background:#21262d;border:1px solid #30363d;padding:1px 8px;border-radius:3px;font-size:9px;color:#8b949e;">Filter ▾</span>
+        </div>
+      </div>
+      <div style="color:#7ee787;">[07:30:01] <span style="color:#4a9eff;">[SRV]</span> Listening on port 15782...</div>
+      <div style="color:#7ee787;">[07:30:02] <span style="color:#4a9eff;">[SRV]</span> Client connected from 10.0.1.100</div>
+      <div style="color:#7ee787;">[07:30:02] <span style="color:#e88a3a;">[CLI]</span> Connected. Bi-directional sync + delete.</div>
+      <div style="color:#c9d1d9;">[07:30:03] <span style="color:#e88a3a;">[CLI]</span> Sync plan: 10 transfers, 2 delete, 141 skipped</div>
+      <div style="color:#c9d1d9;">[07:30:03] <span style="color:#e88a3a;">[CLI]</span> <span style="color:#4a9eff;">[→]</span> docs/report.docx (2.1 MB, gzip)</div>
+      <div style="color:#c9d1d9;">[07:30:04] <span style="color:#e88a3a;">[CLI]</span> <span style="color:#4a9eff;">[→]</span> data/export.csv (15.3 MB, gzip)</div>
+      <div style="color:#d29922;">[07:30:04] <span style="color:#e88a3a;">[CLI]</span> <span style="color:#f85149;">[DEL→]</span> docs/old-report.docx (deleted on server)</div>
+      <div style="color:#c9d1d9;">[07:30:05] <span style="color:#4a9eff;">[SRV]</span> <span style="color:#3fb950;">[←]</span> docs/report.docx received OK</div>
+    </div>
+
+  </div>
+</div>
+
+<style>
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+</style>

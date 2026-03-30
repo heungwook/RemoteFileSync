@@ -1,0 +1,146 @@
+<h2>Which layout structure works best?</h2>
+<p class="subtitle">The app needs: config panels (server + client), control buttons, progress display, and live log viewer</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div style="background:#1a1a2e;border-radius:8px;padding:16px;font-family:monospace;font-size:11px;color:#e0e0e0;">
+        <div style="display:flex;gap:4px;margin-bottom:12px;">
+          <div style="background:#4a9eff;color:white;padding:4px 16px;border-radius:4px 4px 0 0;font-weight:bold;">Server</div>
+          <div style="background:#333;color:#888;padding:4px 16px;border-radius:4px 4px 0 0;">Client</div>
+          <div style="margin-left:auto;display:flex;gap:4px;">
+            <div style="background:#2d8a4e;padding:4px 12px;border-radius:4px;color:white;font-size:10px;">Profile: Work</div>
+          </div>
+        </div>
+        <div style="background:#0d1117;border-radius:4px;padding:12px;margin-bottom:8px;">
+          <div style="color:#888;font-size:9px;margin-bottom:6px;">CONFIGURATION</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+            <div style="background:#161b22;padding:4px 8px;border-radius:3px;border:1px solid #333;">Port: 15782</div>
+            <div style="background:#161b22;padding:4px 8px;border-radius:3px;border:1px solid #333;">Folder: D:\Sync</div>
+            <div style="background:#161b22;padding:4px 8px;border-radius:3px;border:1px solid #333;">Block: 64KB</div>
+            <div style="background:#161b22;padding:4px 8px;border-radius:3px;border:1px solid #333;">Threads: 4</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:8px;">
+          <div style="background:#2d8a4e;padding:4px 16px;border-radius:4px;color:white;">Start</div>
+          <div style="background:#8b5e34;padding:4px 16px;border-radius:4px;color:white;">Pause</div>
+          <div style="background:#9a3434;padding:4px 16px;border-radius:4px;color:white;">Stop</div>
+          <div style="background:#4a5568;padding:4px 16px;border-radius:4px;color:white;">Generate CMD</div>
+        </div>
+        <div style="background:#0d1117;border-radius:4px;padding:8px;height:60px;overflow:hidden;font-size:9px;color:#7ee787;">
+          [07:30:01] Listening on port 15782...<br>
+          [07:30:02] Client connected.<br>
+          [07:30:03] [&larr;] docs/report.docx (2.1 MB)<br>
+          [07:30:04] Sync complete: 5 files
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. Tabbed Layout</h3>
+      <p>Server/Client as tabs. Each tab has its own config, controls, and log viewer. Switch between them. Clean and focused.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div style="background:#1a1a2e;border-radius:8px;padding:16px;font-family:monospace;font-size:11px;color:#e0e0e0;">
+        <div style="display:flex;gap:4px;margin-bottom:8px;align-items:center;">
+          <div style="color:#4a9eff;font-weight:bold;">ExecRFS</div>
+          <div style="margin-left:auto;background:#2d8a4e;padding:2px 10px;border-radius:4px;color:white;font-size:10px;">Profile: Work</div>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:8px;">
+          <div style="flex:1;background:#0d1117;border-radius:4px;padding:8px;">
+            <div style="color:#4a9eff;font-weight:bold;font-size:10px;margin-bottom:6px;">SERVER</div>
+            <div style="font-size:9px;color:#888;">
+              Port: 15782<br>Folder: D:\Sync<br>
+              <span style="color:#2d8a4e;">&#9679; Running</span>
+            </div>
+            <div style="margin-top:4px;display:flex;gap:3px;">
+              <div style="background:#2d8a4e;padding:2px 8px;border-radius:3px;color:white;font-size:9px;">Start</div>
+              <div style="background:#9a3434;padding:2px 8px;border-radius:3px;color:white;font-size:9px;">Stop</div>
+            </div>
+          </div>
+          <div style="flex:1;background:#0d1117;border-radius:4px;padding:8px;">
+            <div style="color:#e88a3a;font-weight:bold;font-size:10px;margin-bottom:6px;">CLIENT</div>
+            <div style="font-size:9px;color:#888;">
+              Host: 127.0.0.1<br>Folder: C:\Sync<br>
+              <span style="color:#e8c43a;">&#9679; Syncing 3/12</span>
+            </div>
+            <div style="margin-top:4px;display:flex;gap:3px;">
+              <div style="background:#8b5e34;padding:2px 8px;border-radius:3px;color:white;font-size:9px;">Pause</div>
+              <div style="background:#9a3434;padding:2px 8px;border-radius:3px;color:white;font-size:9px;">Stop</div>
+            </div>
+          </div>
+        </div>
+        <div style="background:#0d1117;border-radius:4px;padding:8px;height:50px;font-size:9px;color:#7ee787;overflow:hidden;">
+          <span style="color:#4a9eff;">[SRV]</span> Client connected<br>
+          <span style="color:#e88a3a;">[CLI]</span> [&rarr;] docs/report.docx (2.1 MB)<br>
+          <span style="color:#e88a3a;">[CLI]</span> [&rarr;] data/export.csv (15 MB)
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. Side-by-Side Split</h3>
+      <p>Server left, Client right, shared log at bottom. See both at once. Ideal for localhost sync where you run both.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div style="background:#1a1a2e;border-radius:8px;padding:16px;font-family:monospace;font-size:11px;color:#e0e0e0;">
+        <div style="display:flex;gap:4px;margin-bottom:8px;">
+          <div style="background:#4a9eff;padding:3px 12px;border-radius:4px 4px 0 0;color:white;font-size:10px;">Server</div>
+          <div style="background:#333;padding:3px 12px;border-radius:4px 4px 0 0;color:#888;font-size:10px;">Client</div>
+          <div style="margin-left:auto;background:#2d8a4e;padding:2px 10px;border-radius:4px;color:white;font-size:10px;">Profile: Work</div>
+        </div>
+        <div style="background:#0d1117;border-radius:4px;padding:8px;margin-bottom:6px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:9px;">
+            <div style="background:#161b22;padding:3px 6px;border-radius:3px;border:1px solid #333;">Port: 15782</div>
+            <div style="background:#161b22;padding:3px 6px;border-radius:3px;border:1px solid #333;">Folder: D:\Sync</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:4px;margin-bottom:6px;">
+          <div style="background:#2d8a4e;padding:3px 12px;border-radius:4px;color:white;font-size:10px;">Start</div>
+          <div style="background:#9a3434;padding:3px 12px;border-radius:4px;color:white;font-size:10px;">Stop</div>
+          <div style="background:#4a5568;padding:3px 12px;border-radius:4px;color:white;font-size:10px;">Generate</div>
+        </div>
+        <div style="background:#0d1117;border-radius:4px;padding:6px;margin-bottom:4px;">
+          <div style="display:flex;justify-content:space-between;font-size:9px;margin-bottom:4px;">
+            <span style="color:#888;">Progress</span><span style="color:#4a9eff;">3/12 files (25%)</span>
+          </div>
+          <div style="background:#333;border-radius:2px;height:6px;">
+            <div style="background:#4a9eff;width:25%;height:100%;border-radius:2px;"></div>
+          </div>
+        </div>
+        <div style="background:#0d1117;border-radius:4px;padding:6px;height:40px;font-size:9px;color:#7ee787;overflow:hidden;">
+          [07:30:03] [&rarr;] docs/report.docx<br>
+          [07:30:04] Sync complete: 5 files
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. Tabbed Config + Progress Bar</h3>
+      <p>Like A but with a dedicated progress bar section between controls and log. More visual feedback on sync state.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons" style="margin-top:24px;">
+  <div class="pros">
+    <h4>Recommendation: B</h4>
+    <ul>
+      <li>See both server + client simultaneously</li>
+      <li>Perfect for the common localhost sync case</li>
+      <li>Shared log shows interleaved activity</li>
+      <li>Each side has independent controls</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Trade-off</h4>
+    <ul>
+      <li>Needs wider window than tabbed layout</li>
+      <li>Config panels are more compact (less room per side)</li>
+      <li>Can combine with C's progress bar in the shared area</li>
+    </ul>
+  </div>
+</div>
