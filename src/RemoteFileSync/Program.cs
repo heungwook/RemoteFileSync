@@ -80,11 +80,15 @@ public class Program
         catch (OperationCanceledException)
         {
             logger.Summary("Operation cancelled.");
+            // In --json-progress mode the console is suppressed, so without this the GUI
+            // sees nothing at all.
+            progressWriter.WriteError("Operation cancelled.", fatal: false);
             return 1;
         }
         catch (Exception ex)
         {
             logger.Error($"Fatal error: {ex.Message}");
+            progressWriter.WriteError($"Fatal error: {ex.Message}", fatal: true);
             return 3;
         }
     }
