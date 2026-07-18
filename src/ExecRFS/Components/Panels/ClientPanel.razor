@@ -1,4 +1,4 @@
-@* ClientPanel — configure and control the RFS client process *@
+﻿@* ClientPanel — configure and control the RFS client process *@
 @implements IDisposable
 
 <div class="panel">
@@ -161,7 +161,7 @@
                         new TransferInfo(evt.Path ?? "", 0, evt.Size ?? 0, evt.Thread.Value);
                 break;
 
-            case "progress":
+            case "file_progress":
                 if (evt.Thread.HasValue && _activeTransfers.TryGetValue(evt.Thread.Value, out var existing))
                     _activeTransfers[evt.Thread.Value] = existing with
                     {

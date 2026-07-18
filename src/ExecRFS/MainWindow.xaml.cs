@@ -26,10 +26,21 @@ public partial class MainWindow : Window
 
         Closing += (_, _) =>
         {
-            sp.GetService<ProfileService>()?.AutoSave();
             var procs = sp.GetService<SyncProcesses>();
-            procs?.Server.Dispose();
-            procs?.Client.Dispose();
+            try
+            {
+                sp.GetService<ProfileService>()?.AutoSave();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"AutoSave failed on close: {ex}");
+            }
+            finally
+            {
+                // Must run even if AutoSave threw, or both CLI children are orphaned.
+                procs?.Server.Dispose();
+                procs?.Client.Dispose();
+            }
         };
     }
 }

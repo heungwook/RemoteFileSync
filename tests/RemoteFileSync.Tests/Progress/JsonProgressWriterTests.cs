@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using RemoteFileSync.Progress;
 
 namespace RemoteFileSync.Tests.Progress;
@@ -37,7 +37,7 @@ public class JsonProgressWriterTests
     {
         using var sw = new StringWriter();
         var writer = new JsonProgressWriter(sw);
-        writer.WritePlan(10, 2, 141);
+        writer.WritePlan(10, 2, 141, 4096);
         var json = sw.ToString().Trim();
         var doc = JsonDocument.Parse(json);
         Assert.Equal("plan", doc.RootElement.GetProperty("event").GetString());

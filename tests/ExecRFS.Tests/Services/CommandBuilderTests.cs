@@ -6,6 +6,24 @@ namespace ExecRFS.Tests.Services;
 public class CommandBuilderTests
 {
     [Fact]
+    public void Build_ServerMode_EmitsBindAddress()
+    {
+        // The CLI defaults to loopback. Without --bind here, every GUI-launched server would
+        // be unreachable from another machine with no diagnostic.
+        var profile = new SyncProfile { ServerFolder = @"D:\Sync", ServerBindAddress = "0.0.0.0" };
+        var cmd = CommandBuilder.Build(profile, isServer: true);
+        Assert.Contains(@"--bind ""0.0.0.0""", cmd);
+    }
+
+    [Fact]
+    public void Build_ClientMode_DoesNotEmitBindAddress()
+    {
+        var profile = new SyncProfile { ClientFolder = @"D:\Sync", ClientHost = "host" };
+        var cmd = CommandBuilder.Build(profile, isServer: false);
+        Assert.DoesNotContain("--bind", cmd);
+    }
+
+    [Fact]
     public void Build_ServerMode_GeneratesCorrectArgs()
     {
         var profile = new SyncProfile { ServerFolder = @"D:\Sync", ServerPort = 15782 };

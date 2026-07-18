@@ -14,7 +14,12 @@ public sealed class FileTransferSender
         _blockSize = blockSize;
     }
 
-    public async Task SendFileAsync(Stream networkStream, short fileId, string relativePath, CancellationToken ct)
+    /// <summary>
+    /// <paramref name="onBytesSent"/> reports cumulative bytes as chunks go out, so callers
+    /// can emit per-file progress.
+    /// </summary>
+    public async Task SendFileAsync(Stream networkStream, short fileId, string relativePath,
+                                    CancellationToken ct, Action<long>? onBytesSent = null)
     {
         var sourcePath = PathGuard.ResolveWithinRoot(_rootFolder, relativePath);
         var sourceInfo = new FileInfo(sourcePath);
@@ -50,12 +55,15 @@ public sealed class FileTransferSender
             var buffer = new byte[_blockSize];
             int chunkIndex = 0;
             int bytesRead;
+            long totalSent = 0;
             while ((bytesRead = await fileStream.ReadAsync(buffer, ct)) > 0)
             {
                 var chunkData = bytesRead == buffer.Length ? buffer : buffer[..bytesRead];
                 var chunkPayload = ProtocolHandler.SerializeFileChunk(fileId, chunkIndex, chunkData);
                 await ProtocolHandler.WriteMessageAsync(networkStream, MessageType.FileChunk, chunkPayload, ct);
                 chunkIndex++;
+                totalSent += bytesRead;
+                onBytesSent?.Invoke(totalSent);
             }
 
             var endPayload = ProtocolHandler.SerializeFileEnd(fileId, sha256);

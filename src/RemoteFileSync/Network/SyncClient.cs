@@ -173,7 +173,12 @@ public sealed class SyncClient
         var deleteSummary = deleteCount > 0 ? $", {deleteCount} delete" : "";
         _logger.Info($"Sync plan: {transferCount} transfers{deleteSummary}, {skipCount} skipped");
 
-        _progress.WritePlan(transferCount, deleteCount, skipCount);
+        // Total bytes the client will push, so the GUI can show real progress rather than
+        // guessing from file counts.
+        long plannedBytes = syncPlan
+            .Where(p => p.Action is SyncActionType.SendToServer or SyncActionType.ClientOnly)
+            .Sum(p => clientManifest.Get(p.RelativePath)?.FileSize ?? 0);
+        _progress.WritePlan(transferCount, deleteCount, skipCount, plannedBytes);
         var planBytes = ProtocolHandler.SerializeSyncPlan(syncPlan);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncPlan, planBytes, ct);
 
@@ -262,7 +267,13 @@ public sealed class SyncClient
             try
             {
                 short fileId = (short)(filesTransferred % short.MaxValue);
-                await sender.SendFileAsync(stream, fileId, action.RelativePath, ct);
+                var planned = clientManifest.Get(action.RelativePath);
+                _progress.WriteFileStart("to_server", action.RelativePath, planned?.FileSize ?? 0,
+                    compressed: !CompressionHelper.IsAlreadyCompressed(Path.GetExtension(action.RelativePath)),
+                    thread: 0);
+                await sender.SendFileAsync(stream, fileId, action.RelativePath, ct,
+                    onBytesSent: sent => _progress.WriteFileProgress(
+                        action.RelativePath, sent, planned?.FileSize ?? 0, thread: 0));
 
                 var (cType, cData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
                 if (cType != MessageType.BackupConfirm)
@@ -329,11 +340,13 @@ public sealed class SyncClient
                     {
                         filesDeleted++;
                         _logger.Info($"[DEL→] {del.RelativePath} (deleted on server)");
+                        _progress.WriteDelete(del.RelativePath, backed_up: true, success: true);
                         _db?.MarkDeleted(del.RelativePath, sessionId, "deleted on client, propagated to server");
                     }
                     else
                     {
                         _logger.Warning($"Server failed to delete {del.RelativePath}");
+                        _progress.WriteDelete(del.RelativePath, backed_up: false, success: false);
                         skippedFiles++;
                     }
                 }
@@ -450,6 +463,7 @@ public sealed class SyncClient
                     skippedFiles++;
                 }
 
+                _progress.WriteDelete(path, backed_up: backupFirst, success: success);
                 var confirmPayload = ProtocolHandler.SerializeDeleteConfirm(path, success);
                 await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteConfirm, confirmPayload, ct);
             }
