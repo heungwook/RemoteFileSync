@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
@@ -46,7 +46,7 @@ public class DeleteThresholdTests : IDisposable
     private async Task<int> RunClientAsync(SyncDatabase db, bool forceDelete)
     {
         int port = GetFreePort();
-        var serverOpts = new SyncOptions { IsServer = true, Port = port, Folder = _serverDir };
+        var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
         var clientOpts = new SyncOptions
         {
             IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir,

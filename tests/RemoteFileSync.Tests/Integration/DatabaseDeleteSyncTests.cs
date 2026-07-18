@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using Microsoft.Data.Sqlite;
 using RemoteFileSync.Logging;
@@ -52,7 +52,7 @@ public class DatabaseDeleteSyncTests : IDisposable
     private async Task<(int clientResult, int serverResult)> RunSyncAsync(
         int port, bool bidirectional, bool deleteEnabled, SyncDatabase? db = null)
     {
-        var serverOpts = new SyncOptions { IsServer = true, Port = port, Folder = _serverDir, DeleteEnabled = deleteEnabled };
+        var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir, DeleteEnabled = deleteEnabled };
         var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = bidirectional, DeleteEnabled = deleteEnabled };
 
         using var serverLogger = new SyncLogger(false, null);

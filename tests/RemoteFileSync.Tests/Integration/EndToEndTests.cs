@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
@@ -48,7 +48,7 @@ public class EndToEndTests : IDisposable
         CreateFile(_clientDir, Path.Combine("sub", "data.csv"), "col1,col2\n1,2");
 
         int port = GetFreePort();
-        var serverOpts = new SyncOptions { IsServer = true, Port = port, Folder = _serverDir };
+        var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
         var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = false };
 
         using var serverLogger = new SyncLogger(false, null);
@@ -82,7 +82,7 @@ public class EndToEndTests : IDisposable
         CreateFile(_serverDir, "server-only.txt", "only on server");
 
         int port = GetFreePort();
-        var serverOpts = new SyncOptions { IsServer = true, Port = port, Folder = _serverDir };
+        var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
         var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = true };
 
         using var serverLogger = new SyncLogger(false, null);
@@ -122,7 +122,7 @@ public class EndToEndTests : IDisposable
         CreateFileWithTimestamp(_serverDir, "same.txt", "identical", ts);
 
         int port = GetFreePort();
-        var serverOpts = new SyncOptions { IsServer = true, Port = port, Folder = _serverDir };
+        var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
         var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = true };
 
         using var serverLogger = new SyncLogger(false, null);
@@ -146,12 +146,12 @@ public class EndToEndTests : IDisposable
 
     /// <summary>
     /// Runs one full client/server sync against the shared test folders.
-    /// The server is single-accept, so each sync needs a fresh instance.
+    /// Uses Once=true so the server returns after the sync instead of looping.
     /// </summary>
     private async Task<(int client, int server)> RunSyncAsync(bool bidirectional)
     {
         int port = GetFreePort();
-        var serverOpts = new SyncOptions { IsServer = true, Port = port, Folder = _serverDir };
+        var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
         var clientOpts = new SyncOptions
         {
             IsServer = false, Host = "127.0.0.1", Port = port,

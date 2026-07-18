@@ -44,6 +44,10 @@ public sealed class StdinCommandReader : IDisposable
                         break;
                     case "STOP":
                         StopToken.Cancel();
+                        // Release anyone blocked in WaitWhilePaused: this loop is about to
+                        // exit, so RESUME can never arrive and a PAUSE+STOP would otherwise
+                        // block the sync thread forever.
+                        PauseGate.Set();
                         WriteStatus("stopping");
                         return;
                 }
@@ -64,9 +68,22 @@ public sealed class StdinCommandReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// Blocks while paused. Honours both the caller's token (Ctrl+C) and STOP.
+    /// Returns false if the sync should stop.
+    /// </summary>
+    public bool WaitWhilePaused(CancellationToken ct)
+    {
+        PauseGate.Wait(ct);
+        return !StopToken.IsCancellationRequested;
+    }
+
     public void Dispose()
     {
         if (_input == null) return; // Null instance is a shared singleton — never dispose it
+        // Never tear down primitives with a waiter still blocked on them.
+        PauseGate.Set();
+        if (!StopToken.IsCancellationRequested) StopToken.Cancel();
         StopToken.Dispose();
         PauseGate.Dispose();
     }

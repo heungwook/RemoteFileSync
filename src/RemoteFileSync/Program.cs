@@ -162,6 +162,9 @@ public class Program
                 case "--force-delete":
                     options.ForceDelete = true;
                     break;
+                case "--once":
+                    options.Once = true;
+                    break;
                 case "--bind":
                     options.BindAddress = NextValue(args, ref i, "--bind");
                     break;
@@ -194,6 +197,7 @@ public class Program
         Console.Error.WriteLine("                          files (default: 25). Guards against a");
         Console.Error.WriteLine("                          repointed or empty peer folder.");
         Console.Error.WriteLine("  --force-delete          Bypass --max-delete-percent");
+        Console.Error.WriteLine("  --once                  Server: handle one connection, then exit");
         Console.Error.WriteLine("  --backup-folder <path>  Backup folder (default: .rfs-backups-NAME beside");
         Console.Error.WriteLine("                          the sync folder; must be outside it)");
         Console.Error.WriteLine("  --include <pattern>     Glob include pattern (repeatable)");

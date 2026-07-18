@@ -25,6 +25,13 @@ public sealed class SyncOptions
     public string BindAddress { get; set; } = "127.0.0.1";
 
     /// <summary>
+    /// Server: handle one connection and exit. Off by default — a persistent listener means a
+    /// stray connection (port scan, failed attempt) cannot kill the server before the real
+    /// client arrives. Use for scripted one-shot syncs.
+    /// </summary>
+    public bool Once { get; set; }
+
+    /// <summary>
     /// Abort the sync if deletions would exceed this percentage of tracked files. Guards
     /// against an empty or repointed peer folder wiping the other side. 100 disables it.
     /// Only applied once the tracked population reaches

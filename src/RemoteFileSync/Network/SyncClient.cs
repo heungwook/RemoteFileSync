@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net.Sockets;
 using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
@@ -36,13 +36,17 @@ public sealed class SyncClient
 
     public async Task<int> RunAsync(CancellationToken ct)
     {
-        using var tcp = new TcpClient();
         int retries = 3;
+        TcpClient? tcp = null;
 
         for (int attempt = 1; attempt <= retries; attempt++)
         {
             try
             {
+                // A socket whose connect failed cannot be reconnected, so each attempt needs
+                // a fresh client; reusing one made retries 2 and 3 fail instantly.
+                tcp?.Dispose();
+                tcp = new TcpClient();
                 _logger.Summary($"Connecting to {_options.Host}:{_options.Port}...");
                 await tcp.ConnectAsync(_options.Host!, _options.Port, ct);
                 break;
@@ -54,10 +58,16 @@ public sealed class SyncClient
             }
             catch (SocketException ex)
             {
-                _logger.Error($"Connection failed after {retries} attempts: {ex.Message}");
+                var msg = $"Connection failed after {retries} attempts: {ex.Message}";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                tcp?.Dispose();
                 return 2;
             }
         }
+
+        if (tcp is null) return 2;
+        using var owned = tcp;
 
         _progress.WriteStatus("connecting", host: _options.Host, port: _options.Port);
         var modeLabel = _options.Bidirectional ? "Bi-directional" : "Uni-directional";
@@ -66,7 +76,7 @@ public sealed class SyncClient
             (_options.Verbose ? $" Block: {_options.BlockSize / 1024}KB, Threads: {_options.MaxThreads}" : ""));
         _progress.WriteStatus("connected", mode: $"{modeLabel}{deleteLabel}");
 
-        using var stream = tcp.GetStream();
+        using var stream = owned.GetStream();
         return await HandleConnectionAsync(stream, ct);
     }
 
@@ -74,6 +84,7 @@ public sealed class SyncClient
     {
         var sw = Stopwatch.StartNew();
         int skippedFiles = 0;
+        bool stopped = false;
 
         // 1. Send handshake
         byte syncMode = (byte)((_options.Bidirectional ? 1 : 0) | (_options.DeleteEnabled ? 2 : 0));
@@ -247,8 +258,7 @@ public sealed class SyncClient
         bool desynced = false;
         foreach (var action in toSend)
         {
-            _stdinReader.PauseGate.Wait();
-            if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
+            if (!_stdinReader.WaitWhilePaused(ct)) { _logger.Warning("Stop requested."); stopped = true; break; }
             try
             {
                 short fileId = (short)(filesTransferred % short.MaxValue);
@@ -307,8 +317,7 @@ public sealed class SyncClient
             var serverDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnServer).ToList();
             foreach (var del in serverDeletes)
             {
-                _stdinReader.PauseGate.Wait();
-                if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
+                if (!_stdinReader.WaitWhilePaused(ct)) { _logger.Warning("Stop requested."); stopped = true; break; }
                 var payload = ProtocolHandler.SerializeDeleteFile(del.RelativePath, backupFirst: true);
                 await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteFile, payload, ct);
 
@@ -339,15 +348,20 @@ public sealed class SyncClient
 
             foreach (var action in toReceive)
             {
-                _stdinReader.PauseGate.Wait();
-                if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
-                if (action.Action == SyncActionType.SendToClient)
+                if (!_stdinReader.WaitWhilePaused(ct)) { _logger.Warning("Stop requested."); stopped = true; break; }
+                // Snapshot via the pre-commit hook, keyed on the path actually received:
+                // backing up by plan index moved the wrong file whenever the peer skipped one.
+                FileReceiveResult result;
+                try
                 {
-                    if (!backup.BackupFile(action.RelativePath))
-                        _logger.Debug($"No existing file to backup: {action.RelativePath}");
+                    result = await receiver.ReceiveFileAsync(stream, ct,
+                        onBeforeCommit: p => action.Action == SyncActionType.SendToClient && backup.BackupFile(p));
                 }
-
-                var result = await receiver.ReceiveFileAsync(stream, ct);
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.Error($"Error receiving {action.RelativePath}: {ex.Message}");
+                    result = new FileReceiveResult(false, action.RelativePath, ex.Message);
+                }
                 if (result.Success)
                 {
                     _logger.Info($"[←] {result.RelativePath}");
@@ -380,8 +394,7 @@ public sealed class SyncClient
             var clientDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnClient).ToList();
             foreach (var del in clientDeletes)
             {
-                _stdinReader.PauseGate.Wait();
-                if (_stdinReader.StopToken.IsCancellationRequested) { _logger.Warning("Stop requested."); break; }
+                if (!_stdinReader.WaitWhilePaused(ct)) { _logger.Warning("Stop requested."); stopped = true; break; }
                 var (delType, delData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
                 if (delType != MessageType.DeleteFile)
                 {
@@ -444,7 +457,7 @@ public sealed class SyncClient
 
         // 11. Exchange SyncComplete
         sw.Stop();
-        int exitCode = skippedFiles > 0 ? 1 : 0;
+        int exitCode = (skippedFiles > 0 || stopped) ? 1 : 0;
         _progress.WriteComplete(filesTransferred, filesDeleted, bytesTransferred, sw.ElapsedMilliseconds, exitCode);
         var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, filesDeleted, sw.ElapsedMilliseconds);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
@@ -467,7 +480,7 @@ public sealed class SyncClient
             // 12. Guarantee session completion even on exception/cancellation
             if (_db != null && sessionId > 0)
             {
-                var finalExitCode = skippedFiles > 0 ? 1 : 0;
+                var finalExitCode = (skippedFiles > 0 || stopped) ? 1 : 0;
                 _db.CompleteSession(sessionId, filesTransferred, filesDeleted,
                     syncPlan.Count(p => p.Action == SyncActionType.Skip), finalExitCode);
                 _logger.Debug($"Sync session {sessionId} completed (exit code {finalExitCode})");
