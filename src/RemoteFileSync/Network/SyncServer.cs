@@ -153,6 +153,24 @@ public sealed class SyncServer
         // 7. Deletion Phase (Server): Receive DeleteFile from client for DeleteOnServer actions
         if (deleteEnabled)
         {
+            // The plan arrives over the wire from a peer we do not authenticate, so the server
+            // enforces its own bound rather than trusting the client's guard.
+            int requested = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer);
+            if (requested > 0 && serverManifest.Count >= SyncOptions.MinTrackedFilesForDeleteGuard
+                && !_options.ForceDelete)
+            {
+                double pct = requested * 100.0 / serverManifest.Count;
+                if (pct > _options.MaxDeletePercent)
+                {
+                    var msg = $"Rejecting sync plan: peer requested deletion of {requested} of " +
+                              $"{serverManifest.Count} local files ({pct:F0}%), exceeding " +
+                              $"--max-delete-percent {_options.MaxDeletePercent}.";
+                    _logger.Error(msg);
+                    _progress.WriteError(msg, fatal: true);
+                    return 4;
+                }
+            }
+
             var serverDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnServer).ToList();
             foreach (var del in serverDeletes)
             {

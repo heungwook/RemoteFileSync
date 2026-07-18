@@ -139,12 +139,29 @@ public sealed class SyncClient
         var syncPlan = (_db != null)
             ? SyncEngine.ComputePlan(clientManifest, serverManifest, _options.Bidirectional, _db, _options.DeleteEnabled)
             : SyncEngine.ComputePlan(clientManifest, serverManifest, _options.Bidirectional, previousState, _options.DeleteEnabled);
+
+        // A path excluded by local filters must be invisible: never transferred, and above all
+        // never deleted. Its absence from the manifest is otherwise indistinguishable from a
+        // deletion, so tightening a filter would wipe those files on the peer.
+        var filteredOut = syncPlan.Where(p => !scanner.IsIncluded(p.RelativePath)).ToList();
+        if (filteredOut.Count > 0)
+        {
+            _logger.Info($"Ignoring {filteredOut.Count} path(s) excluded by local filters.");
+            syncPlan = syncPlan.Where(p => scanner.IsIncluded(p.RelativePath)).ToList();
+            if (_db != null)
+            {
+                foreach (var entry in filteredOut)
+                    _db.MarkDeleted(entry.RelativePath, sessionId, "excluded by filters; retiring tracked row");
+            }
+        }
+
         var transferCount = syncPlan.Count(p => p.Action != SyncActionType.Skip
             && p.Action != SyncActionType.DeleteOnServer && p.Action != SyncActionType.DeleteOnClient);
         var deleteCount = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer || p.Action == SyncActionType.DeleteOnClient);
         var skipCount = syncPlan.Count(p => p.Action == SyncActionType.Skip);
         var deleteSummary = deleteCount > 0 ? $", {deleteCount} delete" : "";
         _logger.Info($"Sync plan: {transferCount} transfers{deleteSummary}, {skipCount} skipped");
+
         _progress.WritePlan(transferCount, deleteCount, skipCount);
         var planBytes = ProtocolHandler.SerializeSyncPlan(syncPlan);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncPlan, planBytes, ct);
@@ -162,6 +179,15 @@ public sealed class SyncClient
                 else
                     _db.MarkSkipped(skip.RelativePath, sessionId);
             }
+
+            // Retire tracked rows for files absent on both sides. Left as 'exists', a later
+            // restore on one side is resolved as a deletion on the other.
+            foreach (var fs in _db.GetAllTrackedFiles())
+            {
+                if (fs.Status != "exists") continue;
+                if (clientManifest.Contains(fs.Path) || serverManifest.Contains(fs.Path)) continue;
+                _db.MarkDeleted(fs.Path, sessionId, "absent on both sides; retiring tracked row");
+            }
         }
 
         var backup = new BackupManager(_options.Folder, _options.EffectiveBackupFolder);
@@ -173,6 +199,47 @@ public sealed class SyncClient
 
         try  // Guarantee CompleteSession in finally block
         {
+        // Deletion safety gates. Both live inside the try so an abort still completes the
+        // DB session; returning from outside it would leak an open session row.
+        if (_options.DeleteEnabled && deleteCount > 0)
+        {
+            // An incomplete scan cannot justify a deletion: the peer cannot tell a file that
+            // was unreadable from one that was removed.
+            if (scanner.InaccessibleDirectories > 0)
+            {
+                var msg = $"Refusing to propagate deletions: {scanner.InaccessibleDirectories} " +
+                          "directory(ies) could not be read, so the local manifest is incomplete.";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            if (!_options.ForceDelete)
+            {
+                // Denominator is the tracked-file population, NOT a manifest count: with
+                // max(client, server) a peer repointed at a larger unrelated folder yields a
+                // small percentage and every tracked file gets deleted anyway.
+                int tracked = _db != null
+                    ? _db.GetAllTrackedFiles().Count(f => f.Status == "exists")
+                    : previousState?.Manifest.Count ?? 0;
+
+                if (tracked >= SyncOptions.MinTrackedFilesForDeleteGuard)
+                {
+                    double pct = deleteCount * 100.0 / tracked;
+                    if (pct > _options.MaxDeletePercent)
+                    {
+                        var msg = $"Refusing to sync: {deleteCount} of {tracked} tracked files " +
+                                  $"({pct:F0}%) would be deleted, exceeding --max-delete-percent " +
+                                  $"{_options.MaxDeletePercent}. Check that --folder on both sides " +
+                                  "points where you expect. If this is intentional, re-run with --force-delete.";
+                        _logger.Error(msg);
+                        _progress.WriteError(msg, fatal: true);
+                        return 4;
+                    }
+                }
+            }
+        }
+
         // 7. Send files to server (SendToServer + ClientOnly)
         var toSend = syncPlan.Where(p =>
             p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList();

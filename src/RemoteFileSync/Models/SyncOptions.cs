@@ -25,6 +25,25 @@ public sealed class SyncOptions
     public string BindAddress { get; set; } = "127.0.0.1";
 
     /// <summary>
+    /// Abort the sync if deletions would exceed this percentage of tracked files. Guards
+    /// against an empty or repointed peer folder wiping the other side. 100 disables it.
+    /// Only applied once the tracked population reaches
+    /// <see cref="MinTrackedFilesForDeleteGuard"/> — see that field for why.
+    /// </summary>
+    public int MaxDeletePercent { get; set; } = 25;
+
+    /// <summary>
+    /// The percentage guard is only meaningful at scale. Deleting 1 of 2 tracked files is
+    /// 50% but entirely ordinary; deleting 2500 of 10000 is a catastrophe. Applying the
+    /// percentage to tiny populations would fire constantly on normal edits and train users
+    /// to pass --force-delete by reflex, disabling the guard exactly when it matters.
+    /// </summary>
+    public const int MinTrackedFilesForDeleteGuard = 10;
+
+    /// <summary>Bypass <see cref="MaxDeletePercent"/> for an intentional bulk deletion.</summary>
+    public bool ForceDelete { get; set; }
+
+    /// <summary>
     /// Backup destination. Defaults to a sibling ".rfs-backups-NAME" directory OUTSIDE the
     /// sync folder — placing backups inside the synced tree makes them re-scan as new files
     /// and propagate to the peer, growing without bound.

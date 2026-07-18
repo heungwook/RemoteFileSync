@@ -156,6 +156,12 @@ public class Program
                 case "--delete" or "-d":
                     options.DeleteEnabled = true;
                     break;
+                case "--max-delete-percent":
+                    options.MaxDeletePercent = NextInt(args, ref i, "--max-delete-percent");
+                    break;
+                case "--force-delete":
+                    options.ForceDelete = true;
+                    break;
                 case "--bind":
                     options.BindAddress = NextValue(args, ref i, "--bind");
                     break;
@@ -184,6 +190,10 @@ public class Program
         Console.Error.WriteLine("  --folder, -f <path>     Local sync folder (required)");
         Console.Error.WriteLine("  --bidirectional, -b     Enable bi-directional sync");
         Console.Error.WriteLine("  --delete, -d            Enable deletion propagation (opt-in)");
+        Console.Error.WriteLine("  --max-delete-percent <n> Abort if deletions exceed n% of tracked");
+        Console.Error.WriteLine("                          files (default: 25). Guards against a");
+        Console.Error.WriteLine("                          repointed or empty peer folder.");
+        Console.Error.WriteLine("  --force-delete          Bypass --max-delete-percent");
         Console.Error.WriteLine("  --backup-folder <path>  Backup folder (default: .rfs-backups-NAME beside");
         Console.Error.WriteLine("                          the sync folder; must be outside it)");
         Console.Error.WriteLine("  --include <pattern>     Glob include pattern (repeatable)");
@@ -193,5 +203,8 @@ public class Program
         Console.Error.WriteLine("  --verbose, -v           Verbose console output");
         Console.Error.WriteLine("  --log, -l <path>        Log file path");
         Console.Error.WriteLine("  --json-progress         JSON events to stdout (for UI integration)");
+        Console.Error.WriteLine();
+        Console.Error.WriteLine("Exit codes: 0 success, 1 completed with skipped files, 2 connection");
+        Console.Error.WriteLine("failure, 3 protocol/fatal error, 4 aborted by a safety guard.");
     }
 }

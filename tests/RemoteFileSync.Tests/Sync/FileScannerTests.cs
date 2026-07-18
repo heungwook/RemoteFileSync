@@ -1,4 +1,5 @@
 using RemoteFileSync.Sync;
+using RemoteFileSync.Transfer;
 
 namespace RemoteFileSync.Tests.Sync;
 
@@ -112,5 +113,67 @@ public class FileScannerTests : IDisposable
         var entry = manifest.Get("ts.txt");
         Assert.NotNull(entry);
         Assert.Equal(DateTimeKind.Utc, entry.LastModifiedUtc.Kind);
+    }
+
+    [Theory]
+    // Path-shaped patterns previously matched against the filename only and silently did
+    // nothing — the most common real-world exclude was a complete no-op.
+    [InlineData("node_modules/*", "node_modules/index.js", false)]
+    [InlineData("node_modules/*", "node_modules/deep/nested/a.js", false)]
+    [InlineData("node_modules/*", "src/index.js", true)]
+    // Windows users type backslashes; those must be normalised, not misclassified as names.
+    [InlineData("node_modules\\*", "node_modules/index.js", false)]
+    [InlineData("build\\out\\*", "build/out/app.exe", false)]
+    // Plain name patterns keep working at any depth.
+    [InlineData("*.tmp", "a.tmp", false)]
+    [InlineData("*.tmp", "deep/sub/a.tmp", false)]
+    [InlineData("*.tmp", "deep/sub/a.txt", true)]
+    public void Scan_AppliesPathAndNamePatterns(string excludePattern, string relativePath, bool expectIncluded)
+    {
+        CreateFile(relativePath.Replace('/', Path.DirectorySeparatorChar));
+        var scanner = new FileScanner(_testDir, new(), new List<string> { excludePattern });
+
+        var manifest = scanner.Scan();
+
+        Assert.Equal(expectIncluded, manifest.Get(relativePath) != null);
+    }
+
+    [Fact]
+    public void Scan_ExcludesStagingFiles()
+    {
+        CreateFile("real.txt");
+        CreateFile($"real.txt{FileTransferReceiver.StagingSuffix}abc123");
+
+        var manifest = new FileScanner(_testDir, new(), new()).Scan();
+
+        Assert.NotNull(manifest.Get("real.txt"));
+        // Partial receives must never reach the peer.
+        Assert.Single(manifest.Entries);
+    }
+
+    [Fact]
+    public void Scan_SweepsStaleStagingFiles()
+    {
+        var stale = Path.Combine(_testDir, $"old.txt{FileTransferReceiver.StagingSuffix}deadbeef");
+        Directory.CreateDirectory(Path.GetDirectoryName(stale)!);
+        File.WriteAllText(stale, "abandoned");
+        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddDays(-2));
+
+        new FileScanner(_testDir, new(), new()).Scan();
+
+        Assert.False(File.Exists(stale));
+    }
+
+    [Fact]
+    public void Scan_ReportsZeroInaccessibleDirectories_OnAHealthyTree()
+    {
+        CreateFile("a.txt");
+        CreateFile("sub/b.txt".Replace('/', Path.DirectorySeparatorChar));
+
+        var scanner = new FileScanner(_testDir, new(), new());
+        scanner.Scan();
+
+        // Non-zero would mean the manifest is incomplete and deletions must be refused.
+        Assert.Equal(0, scanner.InaccessibleDirectories);
     }
 }
