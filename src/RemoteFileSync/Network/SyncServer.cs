@@ -69,9 +69,15 @@ public sealed class SyncServer
         bool deleteEnabled = (syncMode & 2) != 0;
         _logger.Info($"Handshake: v{version}, {(bidirectional ? "bidirectional" : "unidirectional")}");
 
-        // 2. Send HandshakeAck
-        var ackPayload = ProtocolHandler.SerializeHandshakeAck(1, accepted: true);
+        // 2. Send HandshakeAck — reject version mismatches rather than misparse frames.
+        bool versionOk = version == ProtocolHandler.ProtocolVersion;
+        var ackPayload = ProtocolHandler.SerializeHandshakeAck(ProtocolHandler.ProtocolVersion, accepted: versionOk);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.HandshakeAck, ackPayload, ct);
+        if (!versionOk)
+        {
+            _logger.Error($"Rejected client: protocol v{version}, this build speaks v{ProtocolHandler.ProtocolVersion}.");
+            return 3;
+        }
 
         // 3. Receive client manifest
         var (mType, mData) = await ProtocolHandler.ReadMessageAsync(stream, ct);

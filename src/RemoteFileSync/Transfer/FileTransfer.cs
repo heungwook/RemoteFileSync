@@ -1,4 +1,4 @@
-using RemoteFileSync.Network;
+﻿using RemoteFileSync.Network;
 
 namespace RemoteFileSync.Transfer;
 
@@ -37,7 +37,10 @@ public sealed class FileTransferSender
         try
         {
             var sha256 = CompressionHelper.ComputeSha256(sourcePath);
-            var startPayload = ProtocolHandler.SerializeFileStart(fileId, relativePath, sourceInfo.Length, isCompressed: !alreadyCompressed, _blockSize);
+            var startPayload = ProtocolHandler.SerializeFileStart(
+                fileId, relativePath, sourceInfo.Length,
+                isCompressed: !alreadyCompressed, _blockSize,
+                lastModifiedUtcTicks: sourceInfo.LastWriteTimeUtc.Ticks);
             await ProtocolHandler.WriteMessageAsync(networkStream, MessageType.FileStart, startPayload, ct);
 
             using var fileStream = File.OpenRead(transferSource);
@@ -79,7 +82,8 @@ public sealed class FileTransferReceiver
         if (startType != MessageType.FileStart)
             return new FileReceiveResult(false, "", $"Expected FileStart, got {startType}");
 
-        var (fileId, relativePath, originalSize, isCompressed, blockSize) = ProtocolHandler.DeserializeFileStart(startData);
+        var (fileId, relativePath, originalSize, isCompressed, blockSize, lastModifiedUtcTicks) =
+            ProtocolHandler.DeserializeFileStart(startData);
         var tempPath = Path.Combine(Path.GetTempPath(), $"rfs_recv_{Guid.NewGuid()}.tmp");
 
         try
@@ -114,6 +118,11 @@ public sealed class FileTransferReceiver
                             File.Delete(destPath);
                             return new FileReceiveResult(false, relativePath, "Checksum mismatch");
                         }
+
+                        // Preserve the source timestamp so the file compares equal on the next
+                        // sync. A hostile peer can send arbitrary ticks, so clamp to valid range.
+                        var ticks = Math.Clamp(lastModifiedUtcTicks, 0, DateTime.MaxValue.Ticks);
+                        File.SetLastWriteTimeUtc(destPath, new DateTime(ticks, DateTimeKind.Utc));
                         return new FileReceiveResult(true, relativePath);
                     }
                     else

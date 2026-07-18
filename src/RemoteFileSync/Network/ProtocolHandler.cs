@@ -5,6 +5,32 @@ namespace RemoteFileSync.Network;
 
 public static class ProtocolHandler
 {
+    /// <summary>
+    /// Wire protocol version. v2 added lastModifiedUtcTicks to the FileStart frame.
+    /// Peers running different versions are rejected during handshake: a v1 peer silently
+    /// ignores the trailing timestamp bytes, which makes sync never converge.
+    /// </summary>
+    public const byte ProtocolVersion = 2;
+
+    private static void WritePath(BinaryWriter writer, string path)
+    {
+        var bytes = Encoding.UTF8.GetBytes(path);
+        if (bytes.Length > short.MaxValue)
+            throw new InvalidDataException(
+                $"Path exceeds {short.MaxValue} UTF-8 bytes and cannot be framed: {path}");
+        writer.Write((short)bytes.Length);
+        writer.Write(bytes);
+    }
+
+    private static string ReadPath(BinaryReader reader)
+    {
+        short len = reader.ReadInt16();
+        if (len < 0) throw new InvalidDataException($"Negative path length: {len}");
+        var bytes = reader.ReadBytes(len);
+        if (bytes.Length != len) throw new InvalidDataException("Truncated path in frame.");
+        return Encoding.UTF8.GetString(bytes);
+    }
+
     public static async Task WriteMessageAsync(Stream stream, MessageType type, byte[] payload, CancellationToken ct = default)
     {
         var header = new byte[5];
@@ -40,14 +66,20 @@ public static class ProtocolHandler
     public static byte[] SerializeHandshake(byte version, byte syncMode) =>
         new[] { version, syncMode };
 
-    public static (byte version, byte syncMode) DeserializeHandshake(byte[] data) =>
-        (data[0], data[1]);
+    public static (byte version, byte syncMode) DeserializeHandshake(byte[] data)
+    {
+        if (data.Length < 2) throw new InvalidDataException("Handshake payload truncated.");
+        return (data[0], data[1]);
+    }
 
     public static byte[] SerializeHandshakeAck(byte version, bool accepted) =>
         new[] { version, (byte)(accepted ? 0 : 1) };
 
-    public static (byte version, bool accepted) DeserializeHandshakeAck(byte[] data) =>
-        (data[0], data[1] == 0);
+    public static (byte version, bool accepted) DeserializeHandshakeAck(byte[] data)
+    {
+        if (data.Length < 2) throw new InvalidDataException("HandshakeAck payload truncated.");
+        return (data[0], data[1] == 0);
+    }
 
     public static byte[] SerializeManifest(FileManifest manifest)
     {
@@ -115,32 +147,33 @@ public static class ProtocolHandler
         return plan;
     }
 
-    public static byte[] SerializeFileStart(short fileId, string relativePath, long originalSize, bool isCompressed, int blockSize)
+    public static byte[] SerializeFileStart(short fileId, string relativePath, long originalSize,
+                                            bool isCompressed, int blockSize, long lastModifiedUtcTicks)
     {
         using var ms = new MemoryStream();
         using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
         writer.Write(fileId);
-        var pathBytes = Encoding.UTF8.GetBytes(relativePath);
-        writer.Write((short)pathBytes.Length);
-        writer.Write(pathBytes);
+        WritePath(writer, relativePath);
         writer.Write(originalSize);
         writer.Write((byte)(isCompressed ? 1 : 0));
         writer.Write(blockSize);
+        writer.Write(lastModifiedUtcTicks);
         writer.Flush();
         return ms.ToArray();
     }
 
-    public static (short fileId, string relativePath, long originalSize, bool isCompressed, int blockSize) DeserializeFileStart(byte[] data)
+    public static (short fileId, string relativePath, long originalSize, bool isCompressed,
+                   int blockSize, long lastModifiedUtcTicks) DeserializeFileStart(byte[] data)
     {
         using var ms = new MemoryStream(data);
         using var reader = new BinaryReader(ms, Encoding.UTF8);
         short fileId = reader.ReadInt16();
-        short pathLen = reader.ReadInt16();
-        string path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+        string path = ReadPath(reader);
         long originalSize = reader.ReadInt64();
         bool isCompressed = reader.ReadByte() == 1;
         int blockSize = reader.ReadInt32();
-        return (fileId, path, originalSize, isCompressed, blockSize);
+        long lastModifiedUtcTicks = reader.ReadInt64();
+        return (fileId, path, originalSize, isCompressed, blockSize, lastModifiedUtcTicks);
     }
 
     public static byte[] SerializeFileChunk(short fileId, int chunkIndex, byte[] chunkData)

@@ -76,7 +76,7 @@ public sealed class SyncClient
 
         // 1. Send handshake
         byte syncMode = (byte)((_options.Bidirectional ? 1 : 0) | (_options.DeleteEnabled ? 2 : 0));
-        var hsPayload = ProtocolHandler.SerializeHandshake(1, syncMode);
+        var hsPayload = ProtocolHandler.SerializeHandshake(ProtocolHandler.ProtocolVersion, syncMode);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.Handshake, hsPayload, ct);
 
         // 2. Receive HandshakeAck
@@ -86,7 +86,14 @@ public sealed class SyncClient
             _logger.Error($"Expected HandshakeAck, got {ackType}");
             return 3;
         }
-        var (_, accepted) = ProtocolHandler.DeserializeHandshakeAck(ackData);
+        var (serverVersion, accepted) = ProtocolHandler.DeserializeHandshakeAck(ackData);
+        if (serverVersion != ProtocolHandler.ProtocolVersion)
+        {
+            _logger.Error($"Protocol mismatch: server speaks v{serverVersion}, this build speaks " +
+                          $"v{ProtocolHandler.ProtocolVersion}. Upgrade both sides to the same build. " +
+                          "(A v1 server silently discards the timestamp field and sync will never converge.)");
+            return 2;
+        }
         if (!accepted)
         {
             _logger.Error("Server rejected the connection.");

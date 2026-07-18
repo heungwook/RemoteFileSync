@@ -18,6 +18,28 @@ public class ProtocolHandlerTests
     }
 
     [Fact]
+    public void FileStart_RoundTripsIncludingTimestamp()
+    {
+        var ticks = new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc).Ticks;
+        var payload = ProtocolHandler.SerializeFileStart(1, "a/b.txt", 1234, true, 65536, ticks);
+        var (id, path, size, compressed, block, mtime) = ProtocolHandler.DeserializeFileStart(payload);
+
+        Assert.Equal((short)1, id);
+        Assert.Equal("a/b.txt", path);
+        Assert.Equal(1234, size);
+        Assert.True(compressed);
+        Assert.Equal(65536, block);
+        Assert.Equal(ticks, mtime);   // the assertion that would have caught the convergence bug
+    }
+
+    [Fact]
+    public void DeserializeHandshake_RejectsTruncatedPayload()
+    {
+        Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshake(new byte[] { 2 }));
+        Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshakeAck(Array.Empty<byte>()));
+    }
+
+    [Fact]
     public void SerializeManifest_RoundTrips()
     {
         var manifest = new FileManifest();
