@@ -1,4 +1,5 @@
 using RemoteFileSync.Models;
+using RemoteFileSync.Transfer;
 
 namespace RemoteFileSync.Sync;
 
@@ -15,10 +16,15 @@ public sealed class FileScanner
         _excludePatterns = exclude;
     }
 
+    /// <summary>Age after which an abandoned staging file is swept during a scan.</summary>
+    private static readonly TimeSpan StagingFileMaxAge = TimeSpan.FromHours(24);
+
     public FileManifest Scan()
     {
         var manifest = new FileManifest();
         if (!Directory.Exists(_rootPath)) return manifest;
+
+        SweepAbandonedStagingFiles();
 
         foreach (var fullPath in Directory.EnumerateFiles(_rootPath, "*", SearchOption.AllDirectories))
         {
@@ -31,9 +37,35 @@ public sealed class FileScanner
         return manifest;
     }
 
+    /// <summary>
+    /// Deletes staging files left behind by a crashed or cancelled receive. They are excluded
+    /// from the manifest, so without this they would accumulate inside the sync tree forever.
+    /// </summary>
+    private void SweepAbandonedStagingFiles()
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - StagingFileMaxAge;
+            foreach (var stale in Directory.EnumerateFiles(
+                         _rootPath, $"*{FileTransferReceiver.StagingSuffix}*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(stale) < cutoff) File.Delete(stale);
+                }
+                catch { /* best effort: another process may hold or have removed it */ }
+            }
+        }
+        catch { /* sweeping is opportunistic and must never fail a sync */ }
+    }
+
     private bool MatchesFilters(string relativePath)
     {
         var fileName = Path.GetFileName(relativePath);
+
+        // Never surface in-progress receives: they are not real content, and including them
+        // would propagate partial files to the peer.
+        if (fileName.Contains(FileTransferReceiver.StagingSuffix, StringComparison.Ordinal)) return false;
 
         if (_includePatterns.Count > 0)
         {

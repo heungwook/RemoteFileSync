@@ -209,6 +209,7 @@ public sealed class SyncServer
             var toSend = syncPlan.Where(p =>
                 p.Action == SyncActionType.SendToClient || p.Action == SyncActionType.ServerOnly).ToList();
 
+            bool desynced = false;
             foreach (var action in toSend)
             {
                 _stdinReader.PauseGate.Wait();
@@ -217,17 +218,40 @@ public sealed class SyncServer
                 {
                     short fileId = (short)(filesTransferred % short.MaxValue);
                     await sender.SendFileAsync(stream, fileId, action.RelativePath, ct);
+
+                    var (cType, cData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+                    if (cType != MessageType.BackupConfirm)
+                    {
+                        // See SyncClient: must not throw into the swallow-all catch below.
+                        _logger.Error($"Protocol desync: expected BackupConfirm for {action.RelativePath}, " +
+                                      $"got {cType}. Aborting transfer phase.");
+                        desynced = true;
+                        break;
+                    }
+
+                    if (cData.Length > 0 && cData[^1] != 1)
+                    {
+                        _logger.Error($"Peer failed to commit {action.RelativePath}.");
+                        skippedFiles++;
+                        continue;
+                    }
+
                     _logger.Info($"[→] {action.RelativePath}");
                     filesTransferred++;
-                    var (cType, _) = await ProtocolHandler.ReadMessageAsync(stream, ct);
-                    if (cType != MessageType.BackupConfirm)
-                        _logger.Warning($"Expected BackupConfirm, got {cType}");
                 }
                 catch (Exception ex)
                 {
                     _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}");
                     skippedFiles++;
                 }
+            }
+
+            if (desynced)
+            {
+                // Every later phase reads from the same misaligned stream, so this is terminal.
+                skippedFiles++;
+                _progress.WriteError("Protocol desync during transfer phase; aborting sync.", fatal: true);
+                return 3;
             }
         }
 

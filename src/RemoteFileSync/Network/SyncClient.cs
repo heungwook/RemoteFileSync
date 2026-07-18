@@ -176,6 +176,7 @@ public sealed class SyncClient
         var toSend = syncPlan.Where(p =>
             p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList();
 
+        bool desynced = false;
         foreach (var action in toSend)
         {
             _stdinReader.PauseGate.Wait();
@@ -184,19 +185,37 @@ public sealed class SyncClient
             {
                 short fileId = (short)(filesTransferred % short.MaxValue);
                 await sender.SendFileAsync(stream, fileId, action.RelativePath, ct);
+
+                var (cType, cData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+                if (cType != MessageType.BackupConfirm)
+                {
+                    // MUST NOT throw: the catch below swallows everything, so the loop would
+                    // continue on a stream that is now off by one frame and attribute the next
+                    // file's confirm to the wrong file — and that flag drives MarkSynced.
+                    _logger.Error($"Protocol desync: expected BackupConfirm for {action.RelativePath}, " +
+                                  $"got {cType}. Aborting transfer phase.");
+                    desynced = true;
+                    break;
+                }
+
+                // The peer reports whether it actually committed the file. Trusting the send
+                // alone caused failed writes to be recorded as synced, which the next run then
+                // resolved to a deletion of the surviving local copy.
+                bool peerCommitted = cData.Length > 0 && cData[^1] == 1;
+                if (!peerCommitted)
+                {
+                    _logger.Error($"Peer failed to commit {action.RelativePath}; not recording as synced.");
+                    skippedFiles++;
+                    _progress.WriteFileEnd(action.RelativePath, success: false, error: "peer rejected file");
+                    continue;
+                }
+
                 _logger.Info($"[→] {action.RelativePath}");
                 filesTransferred++;
-                var fi = new FileInfo(Path.Combine(_options.Folder, action.RelativePath.Replace('/', Path.DirectorySeparatorChar)));
-                bytesTransferred += fi.Length;
-                var (cType, _) = await ProtocolHandler.ReadMessageAsync(stream, ct);
-                if (cType != MessageType.BackupConfirm)
-                    _logger.Warning($"Expected BackupConfirm, got {cType}");
+                var sfi = new FileInfo(Path.Combine(_options.Folder, action.RelativePath.Replace('/', Path.DirectorySeparatorChar)));
+                bytesTransferred += sfi.Length;
                 _progress.WriteFileEnd(action.RelativePath, success: true, thread: 0);
-                if (_db != null)
-                {
-                    var sfi = new FileInfo(Path.Combine(_options.Folder, action.RelativePath.Replace('/', Path.DirectorySeparatorChar)));
-                    _db.MarkSynced(action.RelativePath, sfi.Length, sfi.LastWriteTimeUtc, sessionId, "to_server");
-                }
+                _db?.MarkSynced(action.RelativePath, sfi.Length, sfi.LastWriteTimeUtc, sessionId, "to_server");
             }
             catch (Exception ex)
             {
@@ -204,6 +223,14 @@ public sealed class SyncClient
                 skippedFiles++;
                 _progress.WriteFileEnd(action.RelativePath, success: false, error: ex.Message);
             }
+        }
+
+        if (desynced)
+        {
+            // Every later phase reads from the same misaligned stream, so this is terminal.
+            skippedFiles++;
+            _progress.WriteError("Protocol desync during transfer phase; aborting sync.", fatal: true);
+            return 3;   // inside the try — the finally still calls CompleteSession
         }
 
         // 8. Deletion Phase (Server): Send DeleteFile for DeleteOnServer actions

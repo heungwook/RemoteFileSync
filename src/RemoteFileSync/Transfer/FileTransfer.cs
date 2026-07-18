@@ -23,19 +23,21 @@ public sealed class FileTransferSender
         string transferSource;
         string? tempCompressed = null;
 
-        if (!alreadyCompressed)
-        {
-            tempCompressed = Path.Combine(Path.GetTempPath(), $"rfs_gz_{Guid.NewGuid()}.tmp");
-            CompressionHelper.CompressFile(sourcePath, tempCompressed);
-            transferSource = tempCompressed;
-        }
-        else
-        {
-            transferSource = sourcePath;
-        }
-
         try
         {
+            // Inside the try: CompressFile can throw (source locked, disk full), and the
+            // finally below is what deletes the partial temp file.
+            if (!alreadyCompressed)
+            {
+                tempCompressed = Path.Combine(Path.GetTempPath(), $"rfs_gz_{Guid.NewGuid()}.tmp");
+                CompressionHelper.CompressFile(sourcePath, tempCompressed);
+                transferSource = tempCompressed;
+            }
+            else
+            {
+                transferSource = sourcePath;
+            }
+
             var sha256 = CompressionHelper.ComputeSha256(sourcePath);
             var startPayload = ProtocolHandler.SerializeFileStart(
                 fileId, relativePath, sourceInfo.Length,
@@ -69,6 +71,13 @@ public record FileReceiveResult(bool Success, string RelativePath, string? Error
 
 public sealed class FileTransferReceiver
 {
+    /// <summary>
+    /// Marker for in-progress receives. Staging files live beside their destination so the
+    /// commit is a same-volume rename; FileScanner excludes them from every manifest and
+    /// sweeps stale ones, so a crash cannot leak them into the synced set.
+    /// </summary>
+    public const string StagingSuffix = ".rfs-part-";
+
     private readonly string _rootFolder;
 
     public FileTransferReceiver(string rootFolder)
@@ -76,7 +85,16 @@ public sealed class FileTransferReceiver
         _rootFolder = Path.GetFullPath(rootFolder);
     }
 
-    public async Task<FileReceiveResult> ReceiveFileAsync(Stream networkStream, CancellationToken ct)
+    public Task<FileReceiveResult> ReceiveFileAsync(Stream networkStream, CancellationToken ct)
+        => ReceiveFileAsync(networkStream, ct, onBeforeCommit: null);
+
+    /// <summary>
+    /// <paramref name="onBeforeCommit"/> receives the verified file's relative path immediately
+    /// before the destination is replaced, so callers can snapshot the outgoing version. It is
+    /// driven by the path actually received, not by plan order.
+    /// </summary>
+    public async Task<FileReceiveResult> ReceiveFileAsync(Stream networkStream, CancellationToken ct,
+                                                          Func<string, bool>? onBeforeCommit)
     {
         var (startType, startData) = await ProtocolHandler.ReadMessageAsync(networkStream, ct);
         if (startType != MessageType.FileStart)
@@ -84,11 +102,22 @@ public sealed class FileTransferReceiver
 
         var (fileId, relativePath, originalSize, isCompressed, blockSize, lastModifiedUtcTicks) =
             ProtocolHandler.DeserializeFileStart(startData);
-        var tempPath = Path.Combine(Path.GetTempPath(), $"rfs_recv_{Guid.NewGuid()}.tmp");
+
+        var destPath = Path.Combine(_rootFolder, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+
+        // Staging file lives beside the destination so the commit is a same-volume rename.
+        var stagingPath = destPath + $"{StagingSuffix}{Guid.NewGuid():N}";
+        // Only needed for the compressed path: gzip must be fully received before it expands.
+        string? gzPath = isCompressed
+            ? Path.Combine(Path.GetTempPath(), $"rfs_recv_{Guid.NewGuid():N}.tmp")
+            : null;
 
         try
         {
-            using (var tempStream = File.Create(tempPath))
+            // Uncompressed payloads are written straight into staging — no %TEMP% round trip.
+            var sinkPath = gzPath ?? stagingPath;
+            using (var sink = File.Create(sinkPath))
             {
                 while (true)
                 {
@@ -96,33 +125,33 @@ public sealed class FileTransferReceiver
                     if (msgType == MessageType.FileChunk)
                     {
                         var (_, _, chunkData) = ProtocolHandler.DeserializeFileChunk(msgData);
-                        await tempStream.WriteAsync(chunkData, ct);
+                        await sink.WriteAsync(chunkData, ct);
                     }
                     else if (msgType == MessageType.FileEnd)
                     {
                         var (_, expectedHash) = ProtocolHandler.DeserializeFileEnd(msgData);
-                        await tempStream.FlushAsync(ct);
-                        tempStream.Close();
+                        await sink.FlushAsync(ct);
+                        sink.Flush(flushToDisk: true);   // FlushAsync only reaches the OS cache
+                        sink.Close();
 
-                        var destPath = Path.Combine(_rootFolder, relativePath.Replace('/', Path.DirectorySeparatorChar));
-                        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                        if (gzPath != null)
+                            CompressionHelper.DecompressFile(gzPath, stagingPath);
 
-                        if (isCompressed)
-                            CompressionHelper.DecompressFile(tempPath, destPath);
-                        else
-                            File.Copy(tempPath, destPath, overwrite: true);
-
-                        var actualHash = CompressionHelper.ComputeSha256(destPath);
+                        var actualHash = CompressionHelper.ComputeSha256(stagingPath);
                         if (!actualHash.SequenceEqual(expectedHash))
                         {
-                            File.Delete(destPath);
+                            // Destination is still the previous good file. Nothing is destroyed.
                             return new FileReceiveResult(false, relativePath, "Checksum mismatch");
                         }
 
                         // Preserve the source timestamp so the file compares equal on the next
                         // sync. A hostile peer can send arbitrary ticks, so clamp to valid range.
+                        // File.Move preserves the stamp, so set it before committing.
                         var ticks = Math.Clamp(lastModifiedUtcTicks, 0, DateTime.MaxValue.Ticks);
-                        File.SetLastWriteTimeUtc(destPath, new DateTime(ticks, DateTimeKind.Utc));
+                        File.SetLastWriteTimeUtc(stagingPath, new DateTime(ticks, DateTimeKind.Utc));
+
+                        onBeforeCommit?.Invoke(relativePath);
+                        CommitWithRetry(stagingPath, destPath);
                         return new FileReceiveResult(true, relativePath);
                     }
                     else
@@ -134,7 +163,30 @@ public sealed class FileTransferReceiver
         }
         finally
         {
-            if (File.Exists(tempPath)) File.Delete(tempPath);
+            // A cleanup failure must not replace a successful result with an exception.
+            TryDelete(gzPath);
+            TryDelete(stagingPath);
+        }
+    }
+
+    private static void TryDelete(string? path)
+    {
+        if (path == null) return;
+        try { if (File.Exists(path)) File.Delete(path); } catch { /* best effort */ }
+    }
+
+    /// <summary>
+    /// Same-volume rename. Retries briefly: replacing an existing file fails with a sharing
+    /// violation when the destination is open without FILE_SHARE_DELETE, which is common on
+    /// Windows (Office, editors, AV scanners).
+    /// </summary>
+    private static void CommitWithRetry(string stagingPath, string destPath)
+    {
+        const int attempts = 5;
+        for (int i = 1; ; i++)
+        {
+            try { File.Move(stagingPath, destPath, overwrite: true); return; }
+            catch (IOException) when (i < attempts) { Thread.Sleep(100 * i); }
         }
     }
 }
