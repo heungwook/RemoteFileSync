@@ -18,6 +18,13 @@ public sealed class SyncOptions
     public string? LogFile { get; set; }
 
     /// <summary>
+    /// Interface the server binds to. Defaults to loopback: this protocol has NO
+    /// authentication, so exposing it on all interfaces grants anyone who can reach the port
+    /// arbitrary read/write/delete within the sync folder.
+    /// </summary>
+    public string BindAddress { get; set; } = "127.0.0.1";
+
+    /// <summary>
     /// Backup destination. Defaults to a sibling ".rfs-backups-NAME" directory OUTSIDE the
     /// sync folder — placing backups inside the synced tree makes them re-scan as new files
     /// and propagate to the peer, growing without bound.
@@ -57,6 +64,11 @@ public sealed class SyncOptions
             throw new ArgumentException("--host is required in client mode.");
         if (Port < 1 || Port > 65535)
             throw new ArgumentException($"--port must be 1-65535, got {Port}.");
+        // Validate here rather than at bind time so a bad value yields a usage message
+        // instead of an opaque fatal error. Hostnames are intentionally rejected.
+        if (IsServer && !System.Net.IPAddress.TryParse(BindAddress, out _))
+            throw new ArgumentException(
+                $"--bind must be an IP address (got '{BindAddress}'). Use 0.0.0.0 to listen on all interfaces.");
 
         const int minBlock = 4096;
         const int maxBlock = 4 * 1024 * 1024;

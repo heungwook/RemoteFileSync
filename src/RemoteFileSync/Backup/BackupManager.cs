@@ -1,3 +1,5 @@
+using RemoteFileSync.Security;
+
 namespace RemoteFileSync.Backup;
 
 public sealed class BackupManager
@@ -26,7 +28,9 @@ public sealed class BackupManager
 
     private bool Snapshot(string relativePath, bool removeOriginal)
     {
-        var sourcePath = Path.Combine(_syncFolder, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        // relativePath can arrive from the network (deletion propagation), so it must be
+        // contained before it reaches the filesystem.
+        if (!PathGuard.TryResolveWithinRoot(_syncFolder, relativePath, out var sourcePath)) return false;
         if (!File.Exists(sourcePath)) return false;
 
         lock (_lock)

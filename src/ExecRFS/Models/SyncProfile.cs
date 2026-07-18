@@ -5,6 +5,12 @@ public class SyncProfile
     public string Name { get; set; } = "Untitled";
     public string ServerFolder { get; set; } = "";
     public int ServerPort { get; set; } = 15782;
+
+    /// <summary>
+    /// Address the server binds to. Loopback by default — the protocol is unauthenticated,
+    /// so exposing it grants any reachable peer read/write/delete in the sync folder.
+    /// </summary>
+    public string ServerBindAddress { get; set; } = "127.0.0.1";
     public string? ServerBackupFolder { get; set; }
     public int ServerBlockSize { get; set; } = 65536;
     public int ServerMaxThreads { get; set; } = 1;

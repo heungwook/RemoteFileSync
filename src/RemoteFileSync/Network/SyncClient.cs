@@ -4,6 +4,7 @@ using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
 using RemoteFileSync.Progress;
+using RemoteFileSync.Security;
 using RemoteFileSync.State;
 using RemoteFileSync.Sync;
 using RemoteFileSync.Transfer;
@@ -341,9 +342,13 @@ public sealed class SyncClient
                             skippedFiles++;
                         }
                     }
+                    else if (!PathGuard.TryResolveWithinRoot(_options.Folder, path, out var fullPath))
+                    {
+                        _logger.Error($"Rejected delete for path outside sync root: {path}");
+                        skippedFiles++;
+                    }
                     else
                     {
-                        var fullPath = Path.Combine(_options.Folder, path.Replace('/', Path.DirectorySeparatorChar));
                         if (File.Exists(fullPath))
                         {
                             File.Delete(fullPath);

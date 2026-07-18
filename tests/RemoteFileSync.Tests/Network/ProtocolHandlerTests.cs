@@ -17,6 +17,33 @@ public class ProtocolHandlerTests
         Assert.Equal(payload, data);
     }
 
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(int.MinValue)]
+    [InlineData(int.MaxValue)]
+    public async Task ReadMessage_RejectsOutOfRangeLength_WithoutAllocating(int declaredLength)
+    {
+        // A 5-byte frame from an unauthenticated peer must not drive a huge allocation
+        // (or throw OverflowException on a negative length).
+        var header = new byte[5];
+        header[0] = (byte)MessageType.Handshake;
+        BitConverter.TryWriteBytes(header.AsSpan(1), declaredLength);
+
+        using var stream = new MemoryStream(header);
+        await Assert.ThrowsAsync<InvalidDataException>(
+            async () => await ProtocolHandler.ReadMessageAsync(stream));
+    }
+
+    [Fact]
+    public void SerializePath_ThrowsOnOversizedPath()
+    {
+        var huge = new string('a', short.MaxValue + 1);
+        var manifest = new FileManifest();
+        manifest.Add(new FileEntry(huge, 1, DateTime.UtcNow));
+        // Previously an unchecked (short) cast wrapped negative and corrupted the frame.
+        Assert.Throws<InvalidDataException>(() => ProtocolHandler.SerializeManifest(manifest));
+    }
+
     [Fact]
     public void FileStart_RoundTripsIncludingTimestamp()
     {

@@ -1,4 +1,5 @@
 ﻿using RemoteFileSync.Network;
+using RemoteFileSync.Security;
 
 namespace RemoteFileSync.Transfer;
 
@@ -15,7 +16,7 @@ public sealed class FileTransferSender
 
     public async Task SendFileAsync(Stream networkStream, short fileId, string relativePath, CancellationToken ct)
     {
-        var sourcePath = Path.Combine(_rootFolder, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        var sourcePath = PathGuard.ResolveWithinRoot(_rootFolder, relativePath);
         var sourceInfo = new FileInfo(sourcePath);
         var extension = Path.GetExtension(relativePath);
         bool alreadyCompressed = CompressionHelper.IsAlreadyCompressed(extension);
@@ -103,7 +104,8 @@ public sealed class FileTransferReceiver
         var (fileId, relativePath, originalSize, isCompressed, blockSize, lastModifiedUtcTicks) =
             ProtocolHandler.DeserializeFileStart(startData);
 
-        var destPath = Path.Combine(_rootFolder, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        if (!PathGuard.TryResolveWithinRoot(_rootFolder, relativePath, out var destPath))
+            return new FileReceiveResult(false, relativePath, "Rejected path outside sync root");
         Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
 
         // Staging file lives beside the destination so the commit is a same-volume rename.

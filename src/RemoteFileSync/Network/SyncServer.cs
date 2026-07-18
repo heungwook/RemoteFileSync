@@ -5,6 +5,7 @@ using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
 using RemoteFileSync.Progress;
+using RemoteFileSync.Security;
 using RemoteFileSync.State;
 using RemoteFileSync.Sync;
 using RemoteFileSync.Transfer;
@@ -33,9 +34,17 @@ public sealed class SyncServer
 
     public async Task<int> RunAsync(CancellationToken ct)
     {
-        var listener = new TcpListener(IPAddress.Any, _options.Port);
+        if (!IPAddress.TryParse(_options.BindAddress, out var bindIp))
+            throw new ArgumentException($"Invalid --bind address: {_options.BindAddress}");
+
+        var listener = new TcpListener(bindIp, _options.Port);
         listener.Start();
-        _logger.Summary($"Listening on port {_options.Port}...");
+        _logger.Summary($"Listening on {bindIp}:{_options.Port}...");
+        if (!IPAddress.IsLoopback(bindIp))
+            _logger.Warning(
+                "This server is reachable from the network and has NO AUTHENTICATION. " +
+                "Any peer can read, write, and delete within the sync folder. " +
+                "Use only on a trusted network or over a VPN/SSH tunnel.");
         _progress.WriteStatus("listening", port: _options.Port);
 
         try
@@ -175,9 +184,13 @@ public sealed class SyncServer
                             skippedFiles++;
                         }
                     }
+                    else if (!PathGuard.TryResolveWithinRoot(_options.Folder, path, out var fullPath))
+                    {
+                        _logger.Error($"Rejected delete for path outside sync root: {path}");
+                        skippedFiles++;
+                    }
                     else
                     {
-                        var fullPath = Path.Combine(_options.Folder, path.Replace('/', Path.DirectorySeparatorChar));
                         if (File.Exists(fullPath))
                         {
                             File.Delete(fullPath);
