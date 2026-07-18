@@ -17,7 +17,35 @@ public sealed class SyncOptions
     public bool Verbose { get; set; }
     public string? LogFile { get; set; }
 
-    public string EffectiveBackupFolder => BackupFolder ?? Folder;
+    /// <summary>
+    /// Backup destination. Defaults to a sibling ".rfs-backups-NAME" directory OUTSIDE the
+    /// sync folder — placing backups inside the synced tree makes them re-scan as new files
+    /// and propagate to the peer, growing without bound.
+    /// Throws when the sync folder has no parent (a drive root or UNC share root); there is
+    /// no safe default in that case and the user must pass --backup-folder explicitly.
+    /// </summary>
+    public string EffectiveBackupFolder
+    {
+        get
+        {
+            if (BackupFolder != null) return BackupFolder;
+
+            var full = Path.GetFullPath(Folder).TrimEnd(Path.DirectorySeparatorChar);
+            var parent = Path.GetDirectoryName(full);
+            var name = Path.GetFileName(full);
+
+            // A drive root ("E:\") or UNC share root ("\\server\share") has no parent.
+            // Falling back to the sync folder here would silently reintroduce the bug
+            // where backups land inside the synced tree.
+            if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(name))
+                throw new ArgumentException(
+                    $"--folder '{Folder}' is a drive or share root and has no parent directory, " +
+                    "so there is no safe default backup location. Pass --backup-folder explicitly " +
+                    "(it must be outside the sync folder).");
+
+            return Path.Combine(parent, $".rfs-backups-{name}");
+        }
+    }
 
     public void Validate()
     {
@@ -43,5 +71,15 @@ public sealed class SyncOptions
             BlockSize = maxBlock;
         }
         if (MaxThreads < 1) MaxThreads = 1;
+
+        // Backups inside the sync folder are re-scanned as new files and propagated to the
+        // peer, growing without bound. Reject that outright rather than discovering it later.
+        var syncFull = Path.GetFullPath(Folder);
+        if (!syncFull.EndsWith(Path.DirectorySeparatorChar)) syncFull += Path.DirectorySeparatorChar;
+        var backupFull = Path.GetFullPath(EffectiveBackupFolder);
+        if (backupFull.StartsWith(syncFull, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException(
+                $"--backup-folder must be outside the sync folder (got '{backupFull}' inside '{syncFull}'). " +
+                "Backups inside the sync folder are re-synced to the peer and grow without bound.");
     }
 }

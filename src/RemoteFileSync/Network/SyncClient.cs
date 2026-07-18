@@ -301,7 +301,7 @@ public sealed class SyncClient
                 {
                     if (backupFirst)
                     {
-                        if (backup.BackupFile(path))
+                        if (backup.BackupAndRemove(path))
                         {
                             success = true;
                             filesDeleted++;

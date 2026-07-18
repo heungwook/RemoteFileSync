@@ -105,11 +105,13 @@ public class EndToEndTests : IDisposable
         Assert.True(File.Exists(Path.Combine(_clientDir, "server-only.txt")));
         Assert.Equal("only on server", File.ReadAllText(Path.Combine(_clientDir, "server-only.txt")));
 
-        // Server's old shared.txt should be backed up
+        // Server's old shared.txt should be backed up — beside the sync folder, not inside it.
         var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
-        var backupPath = Path.Combine(_serverDir, dateStr, "shared.txt");
-        Assert.True(File.Exists(backupPath));
+        var backupPath = Path.Combine(_testRoot, ".rfs-backups-server", dateStr, "shared.txt");
+        Assert.True(File.Exists(backupPath), $"expected backup at {backupPath}");
         Assert.Equal("server older", File.ReadAllText(backupPath));
+        // And nothing may have been written inside the sync folder itself.
+        Assert.False(Directory.Exists(Path.Combine(_serverDir, dateStr)));
     }
 
     [Fact]

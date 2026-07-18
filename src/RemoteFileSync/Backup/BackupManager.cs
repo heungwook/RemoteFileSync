@@ -12,7 +12,19 @@ public sealed class BackupManager
         _backupFolder = Path.GetFullPath(backupFolder);
     }
 
-    public bool BackupFile(string relativePath)
+    /// <summary>
+    /// Copies the file into the dated backup tree, leaving the original in place.
+    /// Use before overwriting a file with an incoming transfer.
+    /// </summary>
+    public bool BackupFile(string relativePath) => Snapshot(relativePath, removeOriginal: false);
+
+    /// <summary>
+    /// Copies the file into the dated backup tree, then deletes the original.
+    /// Use when propagating a deletion.
+    /// </summary>
+    public bool BackupAndRemove(string relativePath) => Snapshot(relativePath, removeOriginal: true);
+
+    private bool Snapshot(string relativePath, bool removeOriginal)
     {
         var sourcePath = Path.Combine(_syncFolder, relativePath.Replace('/', Path.DirectorySeparatorChar));
         if (!File.Exists(sourcePath)) return false;
@@ -35,7 +47,9 @@ public sealed class BackupManager
                 suffix++;
             }
 
-            File.Move(sourcePath, destPath);
+            // Copy first: if the copy fails we must not have destroyed the original.
+            File.Copy(sourcePath, destPath, overwrite: false);
+            if (removeOriginal) File.Delete(sourcePath);
             return true;
         }
     }
