@@ -1,10 +1,43 @@
-using System.Text;
+﻿using System.Text;
 using RemoteFileSync.Models;
 
 namespace RemoteFileSync.Network;
 
 public static class ProtocolHandler
 {
+    /// <summary>
+    /// Wire protocol version. v2 added lastModifiedUtcTicks to the FileStart frame.
+    /// Peers running different versions are rejected during handshake: a v1 peer silently
+    /// ignores the trailing timestamp bytes, which makes sync never converge.
+    /// </summary>
+    public const byte ProtocolVersion = 2;
+
+    /// <summary>
+    /// Upper bound on a single frame, guarding against a hostile length prefix. Note this also
+    /// bounds the manifest frame, capping a synced tree at roughly 1.3M files; if that ever
+    /// binds, chunk the manifest across frames rather than raising this.
+    /// </summary>
+    public const int MaxMessageBytes = 64 * 1024 * 1024;
+
+    private static void WritePath(BinaryWriter writer, string path)
+    {
+        var bytes = Encoding.UTF8.GetBytes(path);
+        if (bytes.Length > short.MaxValue)
+            throw new InvalidDataException(
+                $"Path exceeds {short.MaxValue} UTF-8 bytes and cannot be framed: {path}");
+        writer.Write((short)bytes.Length);
+        writer.Write(bytes);
+    }
+
+    private static string ReadPath(BinaryReader reader)
+    {
+        short len = reader.ReadInt16();
+        if (len < 0) throw new InvalidDataException($"Negative path length: {len}");
+        var bytes = reader.ReadBytes(len);
+        if (bytes.Length != len) throw new InvalidDataException("Truncated path in frame.");
+        return Encoding.UTF8.GetString(bytes);
+    }
+
     public static async Task WriteMessageAsync(Stream stream, MessageType type, byte[] payload, CancellationToken ct = default)
     {
         var header = new byte[5];
@@ -21,6 +54,8 @@ public static class ProtocolHandler
         await ReadExactAsync(stream, header, ct);
         var type = (MessageType)header[0];
         var length = BitConverter.ToInt32(header, 1);
+        if (length < 0 || length > MaxMessageBytes)
+            throw new InvalidDataException($"Invalid message length {length} (allowed 0..{MaxMessageBytes}).");
         var payload = new byte[length];
         if (length > 0) await ReadExactAsync(stream, payload, ct);
         return (type, payload);
@@ -40,14 +75,20 @@ public static class ProtocolHandler
     public static byte[] SerializeHandshake(byte version, byte syncMode) =>
         new[] { version, syncMode };
 
-    public static (byte version, byte syncMode) DeserializeHandshake(byte[] data) =>
-        (data[0], data[1]);
+    public static (byte version, byte syncMode) DeserializeHandshake(byte[] data)
+    {
+        if (data.Length < 2) throw new InvalidDataException("Handshake payload truncated.");
+        return (data[0], data[1]);
+    }
 
     public static byte[] SerializeHandshakeAck(byte version, bool accepted) =>
         new[] { version, (byte)(accepted ? 0 : 1) };
 
-    public static (byte version, bool accepted) DeserializeHandshakeAck(byte[] data) =>
-        (data[0], data[1] == 0);
+    public static (byte version, bool accepted) DeserializeHandshakeAck(byte[] data)
+    {
+        if (data.Length < 2) throw new InvalidDataException("HandshakeAck payload truncated.");
+        return (data[0], data[1] == 0);
+    }
 
     public static byte[] SerializeManifest(FileManifest manifest)
     {
@@ -56,9 +97,7 @@ public static class ProtocolHandler
         writer.Write(manifest.Count);
         foreach (var entry in manifest.Entries)
         {
-            var pathBytes = Encoding.UTF8.GetBytes(entry.RelativePath);
-            writer.Write((short)pathBytes.Length);
-            writer.Write(pathBytes);
+            WritePath(writer, entry.RelativePath);
             writer.Write(entry.FileSize);
             writer.Write(entry.LastModifiedUtc.Ticks);
         }
@@ -74,8 +113,7 @@ public static class ProtocolHandler
         int count = reader.ReadInt32();
         for (int i = 0; i < count; i++)
         {
-            short pathLen = reader.ReadInt16();
-            var path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+            var path = ReadPath(reader);
             long size = reader.ReadInt64();
             long ticks = reader.ReadInt64();
             manifest.Add(new FileEntry(path, size, new DateTime(ticks, DateTimeKind.Utc)));
@@ -91,9 +129,7 @@ public static class ProtocolHandler
         foreach (var entry in plan)
         {
             writer.Write((byte)entry.Action);
-            var pathBytes = Encoding.UTF8.GetBytes(entry.RelativePath);
-            writer.Write((short)pathBytes.Length);
-            writer.Write(pathBytes);
+            WritePath(writer, entry.RelativePath);
         }
         writer.Flush();
         return ms.ToArray();
@@ -108,39 +144,39 @@ public static class ProtocolHandler
         for (int i = 0; i < count; i++)
         {
             var action = (SyncActionType)reader.ReadByte();
-            short pathLen = reader.ReadInt16();
-            var path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+            var path = ReadPath(reader);
             plan.Add(new SyncPlanEntry(action, path));
         }
         return plan;
     }
 
-    public static byte[] SerializeFileStart(short fileId, string relativePath, long originalSize, bool isCompressed, int blockSize)
+    public static byte[] SerializeFileStart(short fileId, string relativePath, long originalSize,
+                                            bool isCompressed, int blockSize, long lastModifiedUtcTicks)
     {
         using var ms = new MemoryStream();
         using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
         writer.Write(fileId);
-        var pathBytes = Encoding.UTF8.GetBytes(relativePath);
-        writer.Write((short)pathBytes.Length);
-        writer.Write(pathBytes);
+        WritePath(writer, relativePath);
         writer.Write(originalSize);
         writer.Write((byte)(isCompressed ? 1 : 0));
         writer.Write(blockSize);
+        writer.Write(lastModifiedUtcTicks);
         writer.Flush();
         return ms.ToArray();
     }
 
-    public static (short fileId, string relativePath, long originalSize, bool isCompressed, int blockSize) DeserializeFileStart(byte[] data)
+    public static (short fileId, string relativePath, long originalSize, bool isCompressed,
+                   int blockSize, long lastModifiedUtcTicks) DeserializeFileStart(byte[] data)
     {
         using var ms = new MemoryStream(data);
         using var reader = new BinaryReader(ms, Encoding.UTF8);
         short fileId = reader.ReadInt16();
-        short pathLen = reader.ReadInt16();
-        string path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+        string path = ReadPath(reader);
         long originalSize = reader.ReadInt64();
         bool isCompressed = reader.ReadByte() == 1;
         int blockSize = reader.ReadInt32();
-        return (fileId, path, originalSize, isCompressed, blockSize);
+        long lastModifiedUtcTicks = reader.ReadInt64();
+        return (fileId, path, originalSize, isCompressed, blockSize, lastModifiedUtcTicks);
     }
 
     public static byte[] SerializeFileChunk(short fileId, int chunkIndex, byte[] chunkData)
@@ -204,11 +240,9 @@ public static class ProtocolHandler
 
     public static byte[] SerializeDeleteFile(string relativePath, bool backupFirst)
     {
-        var pathBytes = Encoding.UTF8.GetBytes(relativePath);
         using var ms = new MemoryStream();
         using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
-        writer.Write((short)pathBytes.Length);
-        writer.Write(pathBytes);
+        WritePath(writer, relativePath);
         writer.Write((byte)(backupFirst ? 1 : 0));
         writer.Flush();
         return ms.ToArray();
@@ -218,19 +252,16 @@ public static class ProtocolHandler
     {
         using var ms = new MemoryStream(data);
         using var reader = new BinaryReader(ms, Encoding.UTF8);
-        short pathLen = reader.ReadInt16();
-        var path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+        var path = ReadPath(reader);
         bool backupFirst = reader.ReadByte() == 1;
         return (path, backupFirst);
     }
 
     public static byte[] SerializeDeleteConfirm(string relativePath, bool success)
     {
-        var pathBytes = Encoding.UTF8.GetBytes(relativePath);
         using var ms = new MemoryStream();
         using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
-        writer.Write((short)pathBytes.Length);
-        writer.Write(pathBytes);
+        WritePath(writer, relativePath);
         writer.Write((byte)(success ? 1 : 0));
         writer.Flush();
         return ms.ToArray();
@@ -240,8 +271,7 @@ public static class ProtocolHandler
     {
         using var ms = new MemoryStream(data);
         using var reader = new BinaryReader(ms, Encoding.UTF8);
-        short pathLen = reader.ReadInt16();
-        var path = Encoding.UTF8.GetString(reader.ReadBytes(pathLen));
+        var path = ReadPath(reader);
         bool success = reader.ReadByte() == 1;
         return (path, success);
     }

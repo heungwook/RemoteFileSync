@@ -5,6 +5,27 @@ namespace ExecRFS.Tests.Models;
 public class ProgressEventTests
 {
     [Fact]
+    public void TryParse_PlanEvent_CarriesTotalsForTheProgressBar()
+    {
+        // The GUI previously listened for a "scan_complete" event the CLI never emits, so
+        // _totalBytes was never set and the progress bar sat at 0% forever.
+        var evt = ProgressEvent.TryParse(
+            @"{""event"":""plan"",""transfers"":10,""deletes"":2,""skipped"":141,""bytes"":4096}");
+        Assert.NotNull(evt);
+        Assert.Equal("plan", evt.Event);
+        Assert.Equal(10, evt.Transfers);
+        Assert.Equal(4096, evt.Bytes);
+    }
+
+    [Fact]
+    public void TryParse_NonJsonLine_ReturnsNullWithoutThrowing()
+    {
+        // Human-readable log lines share the stream; they must not crash the handler.
+        Assert.Null(ProgressEvent.TryParse("[12:00:00] Connecting to host..."));
+        Assert.Null(ProgressEvent.TryParse(""));
+    }
+
+    [Fact]
     public void TryParse_StatusEvent()
     {
         var evt = ProgressEvent.TryParse(@"{""event"":""status"",""state"":""connecting"",""host"":""10.0.1.50"",""port"":15782}");

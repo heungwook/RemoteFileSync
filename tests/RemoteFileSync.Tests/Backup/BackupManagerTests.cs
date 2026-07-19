@@ -1,4 +1,4 @@
-using RemoteFileSync.Backup;
+﻿using RemoteFileSync.Backup;
 
 namespace RemoteFileSync.Tests.Backup;
 
@@ -30,16 +30,38 @@ public class BackupManagerTests : IDisposable
     }
 
     [Fact]
-    public void BackupFile_MovesToDatedFolder()
+    public void BackupFile_CopiesToDatedFolder_LeavingOriginalInPlace()
     {
         CreateSyncFile("report.docx");
         var mgr = new BackupManager(_syncDir, _backupDir);
         var result = mgr.BackupFile("report.docx");
         Assert.True(result);
+        // Copy, not move: a failed transfer must not leave the sync folder without the file.
+        Assert.True(File.Exists(Path.Combine(_syncDir, "report.docx")));
+        var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
+        Assert.True(File.Exists(Path.Combine(_backupDir, dateStr, "report.docx")));
+        Assert.Equal("original", File.ReadAllText(Path.Combine(_backupDir, dateStr, "report.docx")));
+    }
+
+    [Fact]
+    public void BackupAndRemove_CopiesThenDeletesOriginal()
+    {
+        CreateSyncFile("report.docx");
+        var mgr = new BackupManager(_syncDir, _backupDir);
+        var result = mgr.BackupAndRemove("report.docx");
+        Assert.True(result);
+        // Deletion propagation: the original goes away, but only after the copy succeeded.
         Assert.False(File.Exists(Path.Combine(_syncDir, "report.docx")));
         var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
         Assert.True(File.Exists(Path.Combine(_backupDir, dateStr, "report.docx")));
         Assert.Equal("original", File.ReadAllText(Path.Combine(_backupDir, dateStr, "report.docx")));
+    }
+
+    [Fact]
+    public void BackupAndRemove_FileDoesNotExist_ReturnsFalse()
+    {
+        var mgr = new BackupManager(_syncDir, _backupDir);
+        Assert.False(mgr.BackupAndRemove("nonexistent.txt"));
     }
 
     [Fact]
@@ -75,12 +97,12 @@ public class BackupManagerTests : IDisposable
     }
 
     [Fact]
-    public void BackupFile_ThreadSafe_NoCrash()
+    public async Task BackupFile_ThreadSafe_NoCrash()
     {
         for (int i = 0; i < 10; i++) CreateSyncFile($"file{i}.txt", $"content{i}");
         var mgr = new BackupManager(_syncDir, _backupDir);
         var tasks = Enumerable.Range(0, 10).Select(i => Task.Run(() => mgr.BackupFile($"file{i}.txt"))).ToArray();
-        Task.WaitAll(tasks);
-        Assert.All(tasks, t => Assert.True(t.Result));
+        var results = await Task.WhenAll(tasks);
+        Assert.All(results, Assert.True);
     }
 }

@@ -12,6 +12,10 @@ public static class CommandBuilder
         if (!isServer) sb.Append($" --host \"{profile.ClientHost}\"");
         sb.Append($" --folder \"{(isServer ? profile.ServerFolder : profile.ClientFolder)}\"");
         sb.Append($" --port {(isServer ? profile.ServerPort : profile.ClientPort)}");
+        // Without this the CLI's loopback default silently makes a GUI-launched server
+        // unreachable from any other machine, with no diagnostic.
+        if (isServer && !string.IsNullOrWhiteSpace(profile.ServerBindAddress))
+            sb.Append($" --bind \"{profile.ServerBindAddress}\"");
         var backupFolder = isServer ? profile.ServerBackupFolder : profile.ClientBackupFolder;
         if (!string.IsNullOrWhiteSpace(backupFolder)) sb.Append($" --backup-folder \"{backupFolder}\"");
         if (!isServer && profile.Bidirectional) sb.Append(" --bidirectional");

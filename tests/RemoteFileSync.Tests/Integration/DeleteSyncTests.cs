@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
@@ -49,7 +49,7 @@ public class DeleteSyncTests : IDisposable
 
     private async Task<(int clientResult, int serverResult)> RunSyncAsync(int port, bool bidirectional, bool deleteEnabled, SyncStateManager? stateManager = null)
     {
-        var serverOpts = new SyncOptions { IsServer = true, Port = port, Folder = _serverDir, DeleteEnabled = deleteEnabled };
+        var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir, DeleteEnabled = deleteEnabled };
         var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = bidirectional, DeleteEnabled = deleteEnabled };
 
         using var serverLogger = new SyncLogger(false, null);
@@ -106,7 +106,7 @@ public class DeleteSyncTests : IDisposable
         Assert.Equal(0, serverResult);
         Assert.False(File.Exists(Path.Combine(_serverDir, "to-delete.txt")));
         var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
-        Assert.True(File.Exists(Path.Combine(_serverDir, dateStr, "to-delete.txt")));
+        Assert.True(File.Exists(Path.Combine(_testRoot, ".rfs-backups-server", dateStr, "to-delete.txt")));
     }
 
     [Fact]
@@ -158,8 +158,8 @@ public class DeleteSyncTests : IDisposable
         Assert.False(File.Exists(Path.Combine(_clientDir, "server-deleted.txt")));
         // Both files should be backed up before deletion
         var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
-        Assert.True(File.Exists(Path.Combine(_serverDir, dateStr, "client-deleted.txt")));
-        Assert.True(File.Exists(Path.Combine(_clientDir, dateStr, "server-deleted.txt")));
+        Assert.True(File.Exists(Path.Combine(_testRoot, ".rfs-backups-server", dateStr, "client-deleted.txt")));
+        Assert.True(File.Exists(Path.Combine(_testRoot, ".rfs-backups-client", dateStr, "server-deleted.txt")));
     }
 
     [Fact]

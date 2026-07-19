@@ -13,10 +13,24 @@ public sealed class SyncLogger : IDisposable
         _suppressConsole = suppressConsole;
         if (!string.IsNullOrWhiteSpace(logFile))
         {
-            var dir = Path.GetDirectoryName(logFile);
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
-            _logWriter = new StreamWriter(logFile, append: true) { AutoFlush = true };
+            try
+            {
+                var dir = Path.GetDirectoryName(logFile);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+                // FileShare.ReadWrite so a concurrent client+server pair can share one log
+                // path — the GUI launches both, and StreamWriter's default share mode made
+                // the second one throw.
+                var fs = new FileStream(logFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                _logWriter = new StreamWriter(fs) { AutoFlush = true };
+            }
+            catch (Exception ex)
+            {
+                // Degrade to console-only rather than aborting the sync, but say so: a
+                // silently missing log is worse than a noisy one.
+                _logWriter = null;
+                Console.Error.WriteLine($"Warning: cannot open log file '{logFile}': {ex.Message}. Continuing without a log file.");
+            }
         }
     }
 

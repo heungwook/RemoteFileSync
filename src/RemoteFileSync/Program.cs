@@ -1,3 +1,4 @@
+﻿using System.Globalization;
 using RemoteFileSync.Models;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Progress;
@@ -79,13 +80,32 @@ public class Program
         catch (OperationCanceledException)
         {
             logger.Summary("Operation cancelled.");
+            // In --json-progress mode the console is suppressed, so without this the GUI
+            // sees nothing at all.
+            progressWriter.WriteError("Operation cancelled.", fatal: false);
             return 1;
         }
         catch (Exception ex)
         {
             logger.Error($"Fatal error: {ex.Message}");
+            progressWriter.WriteError($"Fatal error: {ex.Message}", fatal: true);
             return 3;
         }
+    }
+
+    private static string NextValue(string[] args, ref int i, string flag)
+    {
+        if (i + 1 >= args.Length)
+            throw new ArgumentException($"Missing value for {flag}.");
+        return args[++i];
+    }
+
+    private static int NextInt(string[] args, ref int i, string flag)
+    {
+        var raw = NextValue(args, ref i, flag);
+        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+            throw new ArgumentException($"{flag} expects an integer, got '{raw}'.");
+        return value;
     }
 
     public static SyncOptions ParseArgs(string[] args)
@@ -105,40 +125,52 @@ public class Program
             switch (arg)
             {
                 case "--host" or "-h":
-                    options.Host = args[++i];
+                    options.Host = NextValue(args, ref i, "--host");
                     break;
                 case "--port" or "-p":
-                    options.Port = int.Parse(args[++i]);
+                    options.Port = NextInt(args, ref i, "--port");
                     break;
                 case "--folder" or "-f":
-                    options.Folder = args[++i];
+                    options.Folder = NextValue(args, ref i, "--folder");
                     break;
                 case "--bidirectional" or "-b":
                     options.Bidirectional = true;
                     break;
                 case "--backup-folder":
-                    options.BackupFolder = args[++i];
+                    options.BackupFolder = NextValue(args, ref i, "--backup-folder");
                     break;
                 case "--include":
-                    options.IncludePatterns.Add(args[++i]);
+                    options.IncludePatterns.Add(NextValue(args, ref i, "--include"));
                     break;
                 case "--exclude":
-                    options.ExcludePatterns.Add(args[++i]);
+                    options.ExcludePatterns.Add(NextValue(args, ref i, "--exclude"));
                     break;
                 case "--block-size" or "-bs":
-                    options.BlockSize = int.Parse(args[++i]);
+                    options.BlockSize = NextInt(args, ref i, "--block-size");
                     break;
                 case "--max-threads" or "-t":
-                    options.MaxThreads = int.Parse(args[++i]);
+                    options.MaxThreads = NextInt(args, ref i, "--max-threads");
                     break;
                 case "--verbose" or "-v":
                     options.Verbose = true;
                     break;
                 case "--log" or "-l":
-                    options.LogFile = args[++i];
+                    options.LogFile = NextValue(args, ref i, "--log");
                     break;
                 case "--delete" or "-d":
                     options.DeleteEnabled = true;
+                    break;
+                case "--max-delete-percent":
+                    options.MaxDeletePercent = NextInt(args, ref i, "--max-delete-percent");
+                    break;
+                case "--force-delete":
+                    options.ForceDelete = true;
+                    break;
+                case "--once":
+                    options.Once = true;
+                    break;
+                case "--bind":
+                    options.BindAddress = NextValue(args, ref i, "--bind");
                     break;
                 case "--json-progress":
                     options.JsonProgress = true;
@@ -159,10 +191,19 @@ public class Program
         Console.Error.WriteLine("Options:");
         Console.Error.WriteLine("  --host, -h <addr>       Server hostname/IP (client only)");
         Console.Error.WriteLine("  --port, -p <port>       TCP port (default: 15782)");
+        Console.Error.WriteLine("  --bind <ip>             Server bind address (default: 127.0.0.1).");
+        Console.Error.WriteLine("                          Use 0.0.0.0 to expose on all interfaces —");
+        Console.Error.WriteLine("                          WARNING: the protocol is UNAUTHENTICATED.");
         Console.Error.WriteLine("  --folder, -f <path>     Local sync folder (required)");
         Console.Error.WriteLine("  --bidirectional, -b     Enable bi-directional sync");
         Console.Error.WriteLine("  --delete, -d            Enable deletion propagation (opt-in)");
-        Console.Error.WriteLine("  --backup-folder <path>  Backup folder (default: sync folder)");
+        Console.Error.WriteLine("  --max-delete-percent <n> Abort if deletions exceed n% of tracked");
+        Console.Error.WriteLine("                          files (default: 25). Guards against a");
+        Console.Error.WriteLine("                          repointed or empty peer folder.");
+        Console.Error.WriteLine("  --force-delete          Bypass --max-delete-percent");
+        Console.Error.WriteLine("  --once                  Server: handle one connection, then exit");
+        Console.Error.WriteLine("  --backup-folder <path>  Backup folder (default: .rfs-backups-NAME beside");
+        Console.Error.WriteLine("                          the sync folder; must be outside it)");
         Console.Error.WriteLine("  --include <pattern>     Glob include pattern (repeatable)");
         Console.Error.WriteLine("  --exclude <pattern>     Glob exclude pattern (repeatable)");
         Console.Error.WriteLine("  --block-size, -bs <n>   Transfer block size in bytes (default: 65536)");
@@ -170,5 +211,8 @@ public class Program
         Console.Error.WriteLine("  --verbose, -v           Verbose console output");
         Console.Error.WriteLine("  --log, -l <path>        Log file path");
         Console.Error.WriteLine("  --json-progress         JSON events to stdout (for UI integration)");
+        Console.Error.WriteLine();
+        Console.Error.WriteLine("Exit codes: 0 success, 1 completed with skipped files, 2 connection");
+        Console.Error.WriteLine("failure, 3 protocol/fatal error, 4 aborted by a safety guard.");
     }
 }

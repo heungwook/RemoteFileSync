@@ -1,4 +1,4 @@
-@implements IDisposable
+﻿@implements IDisposable
 
 <div class="progress-section">
     <div style="display:flex; justify-content:space-between; align-items:center; font-size:11px; color:var(--muted);">
@@ -81,8 +81,8 @@
     {
         switch (evt.Event)
         {
-            case "scan_complete":
-                _totalFiles = evt.Files ?? _totalFiles;
+            case "plan":
+                _totalFiles = evt.Transfers ?? _totalFiles;
                 _totalBytes = evt.Bytes ?? _totalBytes;
                 break;
 
@@ -91,7 +91,7 @@
                     _threadCurrentBytes[evt.Thread.Value] = 0;
                 break;
 
-            case "progress":
+            case "file_progress":
                 if (evt.Thread.HasValue && evt.BytesSent.HasValue)
                 {
                     _threadCurrentBytes[evt.Thread.Value] = evt.BytesSent.Value;

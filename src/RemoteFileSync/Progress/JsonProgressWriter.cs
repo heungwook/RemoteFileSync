@@ -28,9 +28,9 @@ public sealed class JsonProgressWriter
         WriteLine(new { @event = "manifest", side, files, bytes });
     }
 
-    public void WritePlan(int transfers, int deletes, int skipped)
+    public void WritePlan(int transfers, int deletes, int skipped, long bytes)
     {
-        WriteLine(new { @event = "plan", transfers, deletes, skipped });
+        WriteLine(new { @event = "plan", transfers, deletes, skipped, bytes });
     }
 
     public void WriteFileStart(string action, string path, long size, bool compressed, int thread)

@@ -1,4 +1,4 @@
-using Microsoft.Data.Sqlite;
+﻿using Microsoft.Data.Sqlite;
 using RemoteFileSync.Models;
 using RemoteFileSync.State;
 using RemoteFileSync.Sync;
@@ -53,7 +53,7 @@ public class SyncEngineTests
         var client = new FileManifest();
         var server = MakeManifest(new FileEntry("only-server.txt", 50, T1));
         var plan = SyncEngine.ComputePlan(client, server, bidirectional: false);
-        Assert.Empty(plan.Where(p => p.Action != SyncActionType.Skip));
+        Assert.DoesNotContain(plan, p => p.Action != SyncActionType.Skip);
     }
 
     [Fact]

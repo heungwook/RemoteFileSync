@@ -27,7 +27,7 @@
     <FolderPicker Label="Backup Folder (optional)"
                   Value="@Profile.ServerBackupFolder"
                   ValueChanged="@(v => Profile.ServerBackupFolder = v)"
-                  Placeholder="Leave empty to disable backups" />
+                  Placeholder="Leave empty for default (.rfs-backups-NAME, beside the sync folder)" />
 
     @* Block Size + Max Threads *@
     <div class="field-grid" style="margin-bottom:8px;">

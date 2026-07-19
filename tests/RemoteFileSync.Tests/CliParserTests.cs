@@ -4,6 +4,68 @@ namespace RemoteFileSync.Tests;
 
 public class CliParserTests
 {
+    [Theory]
+    [InlineData("--host")]
+    [InlineData("--port")]
+    [InlineData("--folder")]
+    [InlineData("--backup-folder")]
+    [InlineData("--include")]
+    [InlineData("--exclude")]
+    [InlineData("--block-size")]
+    [InlineData("--max-threads")]
+    [InlineData("--log")]
+    [InlineData("--bind")]
+    [InlineData("--max-delete-percent")]
+    public void MissingValueAfterFlag_ThrowsArgumentException(string flag)
+    {
+        // Previously args[++i] ran off the end and IndexOutOfRangeException escaped the
+        // handler in Main, crashing with a raw stack trace instead of printing usage.
+        Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "client", flag }));
+    }
+
+    [Theory]
+    [InlineData("--port", "not-a-number")]
+    [InlineData("--block-size", "12.5")]
+    [InlineData("--max-threads", "")]
+    [InlineData("--max-delete-percent", "abc")]
+    public void NonNumericValue_ThrowsArgumentException(string flag, string value)
+    {
+        // FormatException is not an ArgumentException, so it used to escape too.
+        Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "client", flag, value }));
+    }
+
+    [Fact]
+    public void ParseArgs_UsesInvariantCultureForNumbers()
+    {
+        var original = Thread.CurrentThread.CurrentCulture;
+        try
+        {
+            // A locale using ',' as the decimal separator must not change flag parsing.
+            Thread.CurrentThread.CurrentCulture = new System.Globalization.CultureInfo("de-DE");
+            var options = Program.ParseArgs(new[] { "client", "--host", "h", "--folder", ".", "--port", "1234" });
+            Assert.Equal(1234, options.Port);
+        }
+        finally
+        {
+            Thread.CurrentThread.CurrentCulture = original;
+        }
+    }
+
+    [Fact]
+    public void ParseArgs_ServerDefaultsToLoopback()
+    {
+        var options = Program.ParseArgs(new[] { "server", "--folder", "." });
+        Assert.Equal("127.0.0.1", options.BindAddress);
+    }
+
+    [Fact]
+    public void Validate_RejectsNonIpBindAddress()
+    {
+        var options = Program.ParseArgs(new[] { "server", "--folder", ".", "--bind", "example.com" });
+        var ex = Assert.Throws<ArgumentException>(() => options.Validate());
+        Assert.Contains("--bind", ex.Message);
+    }
+
     [Fact]
     public void ParseArgs_ServerMode_MinimalArgs()
     {
