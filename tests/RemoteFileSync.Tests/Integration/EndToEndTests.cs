@@ -49,7 +49,7 @@ public class EndToEndTests : IDisposable
 
         int port = GetFreePort();
         var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
-        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = false };
+        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Mode = SyncMode.Push };
 
         using var serverLogger = new SyncLogger(false, null);
         using var clientLogger = new SyncLogger(false, null);
@@ -83,7 +83,7 @@ public class EndToEndTests : IDisposable
 
         int port = GetFreePort();
         var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
-        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = true };
+        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Mode = SyncMode.TwoWay };
 
         using var serverLogger = new SyncLogger(false, null);
         using var clientLogger = new SyncLogger(false, null);
@@ -123,7 +123,7 @@ public class EndToEndTests : IDisposable
 
         int port = GetFreePort();
         var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
-        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = true };
+        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Mode = SyncMode.TwoWay };
 
         using var serverLogger = new SyncLogger(false, null);
         using var clientLogger = new SyncLogger(false, null);
@@ -155,7 +155,7 @@ public class EndToEndTests : IDisposable
         var clientOpts = new SyncOptions
         {
             IsServer = false, Host = "127.0.0.1", Port = port,
-            Folder = _clientDir, Bidirectional = bidirectional
+            Folder = _clientDir, Mode = bidirectional ? SyncMode.TwoWay : SyncMode.Push
         };
 
         using var serverLogger = new SyncLogger(false, null);

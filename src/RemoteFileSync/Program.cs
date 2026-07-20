@@ -108,6 +108,58 @@ public class Program
         return value;
     }
 
+    private static SyncMode ParseMode(string[] args, ref int i)
+    {
+        var raw = NextValue(args, ref i, "--mode");
+        return raw.ToLowerInvariant() switch
+        {
+            "push" => SyncMode.Push,
+            "pull" => SyncMode.Pull,
+            "two-way" => SyncMode.TwoWay,
+            // No fallback to the default: guessing here would sync in the opposite direction
+            // from the one the user asked for, which is a data-loss-shaped mistake.
+            _ => throw new ArgumentException(
+                $"--mode expects 'push', 'pull' or 'two-way', got '{raw}'."),
+        };
+    }
+
+    /// <summary>
+    /// Parses a byte count with an optional K/M/G(B) suffix, 1024-based. Sizes are typed by
+    /// humans as "500M"; a bare long.Parse rejects that common case, and a lenient parse that
+    /// fell back to 0 would read as "no cap" and let the archive fill the disk.
+    /// </summary>
+    private static long ParseSize(string[] args, ref int i, string flag)
+    {
+        var raw = NextValue(args, ref i, flag).Trim();
+        var digits = raw;
+        long multiplier = 1;
+
+        if (digits.Length > 0 && char.ToUpperInvariant(digits[^1]) == 'B')
+            digits = digits[..^1];   // accept "10MB" as well as "10M"
+
+        if (digits.Length > 0)
+        {
+            switch (char.ToUpperInvariant(digits[^1]))
+            {
+                case 'K': multiplier = 1024L; digits = digits[..^1]; break;
+                case 'M': multiplier = 1024L * 1024; digits = digits[..^1]; break;
+                case 'G': multiplier = 1024L * 1024 * 1024; digits = digits[..^1]; break;
+            }
+        }
+
+        if (!long.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+            throw new ArgumentException(
+                $"{flag} expects a size like 500, 4K, 20M or 2G, got '{raw}'.");
+        if (value < 0)
+            throw new ArgumentException($"{flag} must not be negative, got '{raw}'.");
+        // Multiplying past long.MaxValue wraps negative, which Validate() would then reject
+        // with a confusing message about a value the user never typed.
+        if (value > long.MaxValue / multiplier)
+            throw new ArgumentException($"{flag} value '{raw}' is too large for a 64-bit byte count.");
+
+        return value * multiplier;
+    }
+
     public static SyncOptions ParseArgs(string[] args)
     {
         if (args.Length == 0)
@@ -133,11 +185,27 @@ public class Program
                 case "--folder" or "-f":
                     options.Folder = NextValue(args, ref i, "--folder");
                     break;
+                case "--mode":
+                    options.Mode = ParseMode(args, ref i);
+                    break;
                 case "--bidirectional" or "-b":
-                    options.Bidirectional = true;
+                    // Deprecated alias kept so existing scripts and ExecRFS profiles keep working.
+                    options.Mode = SyncMode.TwoWay;
                     break;
                 case "--backup-folder":
                     options.BackupFolder = NextValue(args, ref i, "--backup-folder");
+                    break;
+                case "--mirror":
+                    options.MirrorDeletes = true;
+                    break;
+                case "--archive-folder":
+                    options.ArchiveFolder = NextValue(args, ref i, "--archive-folder");
+                    break;
+                case "--archive-keep-days":
+                    options.ArchiveKeepDays = NextInt(args, ref i, "--archive-keep-days");
+                    break;
+                case "--archive-max-size":
+                    options.ArchiveMaxBytes = ParseSize(args, ref i, "--archive-max-size");
                     break;
                 case "--include":
                     options.IncludePatterns.Add(NextValue(args, ref i, "--include"));
@@ -195,8 +263,15 @@ public class Program
         Console.Error.WriteLine("                          Use 0.0.0.0 to expose on all interfaces —");
         Console.Error.WriteLine("                          WARNING: the protocol is UNAUTHENTICATED.");
         Console.Error.WriteLine("  --folder, -f <path>     Local sync folder (required)");
-        Console.Error.WriteLine("  --bidirectional, -b     Enable bi-directional sync");
+        Console.Error.WriteLine("  --mode <m>              push | pull | two-way (default: push).");
+        Console.Error.WriteLine("                          push: server is made to match the client;");
+        Console.Error.WriteLine("                          pull: client is made to match the server.");
+        Console.Error.WriteLine("  --bidirectional, -b     Deprecated alias for --mode two-way");
         Console.Error.WriteLine("  --delete, -d            Enable deletion propagation (opt-in)");
+        Console.Error.WriteLine("  --mirror                Propagate deletions even without ancestor");
+        Console.Error.WriteLine("                          evidence the file was ever synced. Makes the");
+        Console.Error.WriteLine("                          peer an exact mirror — it can delete files the");
+        Console.Error.WriteLine("                          peer created independently.");
         Console.Error.WriteLine("  --max-delete-percent <n> Abort if deletions exceed n% of tracked");
         Console.Error.WriteLine("                          files (default: 25). Guards against a");
         Console.Error.WriteLine("                          repointed or empty peer folder.");
@@ -204,6 +279,13 @@ public class Program
         Console.Error.WriteLine("  --once                  Server: handle one connection, then exit");
         Console.Error.WriteLine("  --backup-folder <path>  Backup folder (default: .rfs-backups-NAME beside");
         Console.Error.WriteLine("                          the sync folder; must be outside it)");
+        Console.Error.WriteLine("  --archive-folder <path> Archive for deleted/overwritten/conflicting files");
+        Console.Error.WriteLine("                          (default: .rfs-archive-NAME beside the sync");
+        Console.Error.WriteLine("                          folder; must be outside it)");
+        Console.Error.WriteLine("  --archive-keep-days <n> Prune archived sessions older than n days");
+        Console.Error.WriteLine("                          (default: 30; 0 = keep forever)");
+        Console.Error.WriteLine("  --archive-max-size <n>  Prune oldest sessions above this total size.");
+        Console.Error.WriteLine("                          Accepts a K/M/G suffix (default: 0 = no cap)");
         Console.Error.WriteLine("  --include <pattern>     Glob include pattern (repeatable)");
         Console.Error.WriteLine("  --exclude <pattern>     Glob exclude pattern (repeatable)");
         Console.Error.WriteLine("  --block-size, -bs <n>   Transfer block size in bytes (default: 65536)");

@@ -50,7 +50,7 @@ public class DeleteThresholdTests : IDisposable
         var clientOpts = new SyncOptions
         {
             IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir,
-            Bidirectional = true, DeleteEnabled = true, ForceDelete = forceDelete,
+            Mode = SyncMode.TwoWay, DeleteEnabled = true, ForceDelete = forceDelete,
         };
 
         using var serverLogger = new SyncLogger(false, null);
