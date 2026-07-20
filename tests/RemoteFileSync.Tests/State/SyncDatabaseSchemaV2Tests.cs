@@ -273,19 +273,16 @@ public sealed class SyncDatabaseSchemaV2Tests : IDisposable
     }
 
     [Fact]
-    public void PurgeTombstonesOlderThan_NegativeAge_IsANoOp()
+    public void PurgeTombstonesOlderThan_NegativeAge_Throws()
     {
-        // A negative age puts a naive cutoff even further in the future than zero does, so it
-        // gets the same no-op rather than throwing -- there is no reading of "negative
-        // retention" that should behave differently from "zero retention" here.
+        // Unlike zero, negative has no documented meaning anywhere in this project -- it can
+        // only arise from a caller defect (inverted subtraction, bad config arithmetic). This
+        // project's rule is that nonsensical state must be loud, never silently treated as
+        // "nothing to do" (the same reason the pair.marker gate errors out instead of
+        // guessing), so it throws rather than quietly no-opping.
         using var db = new SyncDatabase(_dbPath);
-        var session = db.StartSession("two-way", "/folder", "host", 8765);
-        db.UpsertSynced("old-tombstone.txt", 1, 100, 1, 100, session, "to_server");
-        db.Tombstone("old-tombstone.txt", session, "deleted long ago");
-        SetDeletedUtc("old-tombstone.txt", DateTime.UtcNow.AddYears(-5).Ticks);
-
-        Assert.Equal(0, db.PurgeTombstonesOlderThan(TimeSpan.FromDays(-1)));
-        Assert.Equal("deleted", db.GetRow("old-tombstone.txt")!.Status);
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => db.PurgeTombstonesOlderThan(TimeSpan.FromDays(-1)));
     }
 
     /// <summary>Writes a raw value into a tick column, bypassing the API's own range checks.</summary>

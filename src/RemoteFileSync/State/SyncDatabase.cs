@@ -530,15 +530,24 @@ VALUES ($path, 'deleted', NULL, NULL, $session, NULL, $detail, $ts);";
 
     public int PurgeTombstonesOlderThan(TimeSpan age)
     {
-        // age <= 0 means "no age rule", the same polarity ArchiveKeepDays and the sibling
-        // ArchiveManager.Prune use for "keep forever" (CONTRACT.md correction 3). Without this
-        // guard, TimeSpan.Zero computes cutoff = UtcNow.Ticks - 0, which deletes every
-        // tombstone whose deleted_utc is not in the future — i.e. all of them — destroying the
-        // evidence that distinguishes "re-appeared after deletion" from "never seen". A
-        // negative age would put the cutoff further in the future still, so it gets the same
-        // no-op rather than a narrower carve-out that a caller could trip on either side of.
-        if (age <= TimeSpan.Zero)
+        // Zero and negative are NOT the same case, on purpose. Zero is this project's
+        // documented convention for "retention disabled" (ArchiveKeepDays = 0; the sibling
+        // ArchiveManager.Prune per CONTRACT.md correction 3) -- a legitimate value a caller
+        // passes deliberately. Without a guard, TimeSpan.Zero computes
+        // cutoff = UtcNow.Ticks - 0, which deletes every tombstone whose deleted_utc is not in
+        // the future -- i.e. all of them -- destroying the evidence that distinguishes
+        // "re-appeared after deletion" from "never seen", so it gets an explicit no-op.
+        // Negative has no such meaning; it can only come from a caller defect (inverted
+        // subtraction, bad config arithmetic), and this project's guiding rule is that
+        // nonsensical state must be loud, never silently treated as "nothing to do" -- the
+        // same reason the pair.marker gate errors out instead of guessing. Silently returning
+        // 0 here would let a broken retention setting run forever while tombstones pile up and
+        // nobody notices.
+        if (age == TimeSpan.Zero)
             return 0;
+        if (age < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(age),
+                "Retention age must not be negative.");
 
         using var cmd = _conn.CreateCommand();
         // status is the gate, not deleted_utc alone: an 'exists' row must survive a stale
