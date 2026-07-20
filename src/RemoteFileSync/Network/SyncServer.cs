@@ -136,14 +136,51 @@ public sealed class SyncServer
             _logger.Error($"Expected Handshake, got {hsType}");
             return 3;
         }
-        var (version, syncMode) = ProtocolHandler.DeserializeHandshake(hsData);
-        bool bidirectional = (syncMode & 1) != 0;
-        bool deleteEnabled = (syncMode & 2) != 0;
-        _logger.Info($"Handshake: v{version}, {(bidirectional ? "bidirectional" : "unidirectional")}");
+        byte version;
+        byte syncMode;
+        try
+        {
+            (version, syncMode, _) = ProtocolHandler.DeserializeHandshake(hsData);
+        }
+        catch (InvalidDataException)
+        {
+            // A v2 client's handshake is 2 bytes, which the v3 length guard rejects before its
+            // version byte can be read, so the versionOk path below cannot report the mismatch.
+            // Answer with a well-formed rejecting ack anyway: otherwise the accept loop's
+            // catch-all closes the socket and the peer reports an unexplained disconnect
+            // instead of "upgrade both sides".
+            await ProtocolHandler.WriteMessageAsync(stream, MessageType.HandshakeAck,
+                ProtocolHandler.SerializeHandshakeAck(
+                    ProtocolHandler.ProtocolVersion, accepted: false, DateTime.UtcNow.Ticks), ct);
+            _logger.Error("Rejected client: its handshake is shorter than protocol " +
+                          $"v{ProtocolHandler.ProtocolVersion} requires — the peer is an older build.");
+            return 3;
+        }
+
+        // Clamped through a switch rather than cast: syncMode arrives from an unauthenticated
+        // peer and 0 is not a defined SyncMode member, so a raw cast would yield an enum value
+        // that every later "== SyncMode.Push" comparison reads as "not Push" and admits writes
+        // to the server's tree on.
+        var mode = (syncMode & 0b11) switch
+        {
+            2 => SyncMode.Pull,
+            3 => SyncMode.TwoWay,
+            _ => SyncMode.Push,
+        };
+        bool deleteEnabled = (syncMode & 4) != 0;
+        // Decoded for reporting only. The server executes the plan the client computed, and the
+        // mirror decision is already baked into that plan, so acting on this bit here would
+        // apply the rule twice. Kept as a named local so the log line and Phase 8's server-side
+        // delete accounting read the same value.
+        bool mirrorDeletes = (syncMode & 8) != 0;
+        _logger.Info($"Handshake: v{version}, mode={mode}" +
+                     (deleteEnabled ? " +delete" : "") + (mirrorDeletes ? " +mirror" : ""));
 
         // 2. Send HandshakeAck — reject version mismatches rather than misparse frames.
+        // serverTicks is stamped at send time so the client's round-trip halving is honest.
         bool versionOk = version == ProtocolHandler.ProtocolVersion;
-        var ackPayload = ProtocolHandler.SerializeHandshakeAck(ProtocolHandler.ProtocolVersion, accepted: versionOk);
+        var ackPayload = ProtocolHandler.SerializeHandshakeAck(
+            ProtocolHandler.ProtocolVersion, accepted: versionOk, DateTime.UtcNow.Ticks);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.HandshakeAck, ackPayload, ct);
         if (!versionOk)
         {
@@ -301,8 +338,11 @@ public sealed class SyncServer
             }
         }
 
-        // 8. Send files to client (SendToClient + ServerOnly) if bidirectional
-        if (bidirectional)
+        // 8. Send files to client (SendToClient + ServerOnly). Two-way only at this stage; the
+        // mode-dispatch phase widens the condition to admit Pull, which also writes to the
+        // client. Behaviour is unchanged here — this is the rename forced by dropping the
+        // `bidirectional` local in favour of `mode`.
+        if (mode == SyncMode.TwoWay)
         {
             var toSend = syncPlan.Where(p =>
                 p.Action == SyncActionType.SendToClient || p.Action == SyncActionType.ServerOnly).ToList();
@@ -353,7 +393,7 @@ public sealed class SyncServer
         }
 
         // 9. Deletion Phase (Client): Send DeleteFile for DeleteOnClient actions
-        if (deleteEnabled && bidirectional)
+        if (deleteEnabled && mode == SyncMode.TwoWay)
         {
             var clientDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnClient).ToList();
             foreach (var del in clientDeletes)

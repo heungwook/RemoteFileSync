@@ -6,11 +6,15 @@ namespace RemoteFileSync.Network;
 public static class ProtocolHandler
 {
     /// <summary>
-    /// Wire protocol version. v2 added lastModifiedUtcTicks to the FileStart frame.
+    /// Wire protocol version. v2 added lastModifiedUtcTicks to the FileStart frame. v3 widened
+    /// the handshake to carry the full SyncMode plus the delete and mirror flags — v2 had a
+    /// single "bidirectional" bit, which cannot express push/pull/two-way — and made both sides
+    /// stamp DateTime.UtcNow.Ticks so the client can measure the peer's clock offset; see
+    /// <see cref="Sync.ClockSkew"/>.
     /// Peers running different versions are rejected during handshake: a v1 peer silently
     /// ignores the trailing timestamp bytes, which makes sync never converge.
     /// </summary>
-    public const byte ProtocolVersion = 2;
+    public const byte ProtocolVersion = 3;
 
     /// <summary>
     /// Upper bound on a single frame, guarding against a hostile length prefix. Note this also
@@ -72,22 +76,47 @@ public static class ProtocolHandler
         }
     }
 
-    public static byte[] SerializeHandshake(byte version, byte syncMode) =>
-        new[] { version, syncMode };
-
-    public static (byte version, byte syncMode) DeserializeHandshake(byte[] data)
+    /// <summary>
+    /// v3 handshake, 11 bytes: [0] version, [1] syncMode bits (low 2 = SyncMode, bit 2 =
+    /// deleteEnabled, bit 3 = mirrorDeletes), [2..9] clientSentTicks, [10] reserved (0).
+    /// </summary>
+    public static byte[] SerializeHandshake(byte version, byte syncMode, long clientSentTicks)
     {
-        if (data.Length < 2) throw new InvalidDataException("Handshake payload truncated.");
-        return (data[0], data[1]);
+        var result = new byte[11];
+        result[0] = version;
+        result[1] = syncMode;
+        BitConverter.TryWriteBytes(result.AsSpan(2), clientSentTicks);
+        // result[10] stays 0. It is reserved but still transmitted, so both v3 peers agree on
+        // the frame length and a later flag can occupy it without another version bump.
+        return result;
     }
 
-    public static byte[] SerializeHandshakeAck(byte version, bool accepted) =>
-        new[] { version, (byte)(accepted ? 0 : 1) };
-
-    public static (byte version, bool accepted) DeserializeHandshakeAck(byte[] data)
+    public static (byte version, byte syncMode, long clientSentTicks) DeserializeHandshake(byte[] data)
     {
-        if (data.Length < 2) throw new InvalidDataException("HandshakeAck payload truncated.");
-        return (data[0], data[1] == 0);
+        // Length is checked before any indexing: a short frame from an older or hostile peer
+        // would otherwise read whatever followed the buffer as a clock reading, and ClockSkew
+        // would silently normalise every server mtime by a garbage offset.
+        if (data.Length < 11) throw new InvalidDataException("Handshake payload truncated.");
+        return (data[0], data[1], BitConverter.ToInt64(data, 2));
+    }
+
+    /// <summary>
+    /// v3 ack, 10 bytes: [0] version, [1] accepted (0 = accepted — v2's polarity, kept so an
+    /// older peer reading only the first two bytes still sees the verdict), [2..9] serverTicks.
+    /// </summary>
+    public static byte[] SerializeHandshakeAck(byte version, bool accepted, long serverTicks)
+    {
+        var result = new byte[10];
+        result[0] = version;
+        result[1] = (byte)(accepted ? 0 : 1);
+        BitConverter.TryWriteBytes(result.AsSpan(2), serverTicks);
+        return result;
+    }
+
+    public static (byte version, bool accepted, long serverTicks) DeserializeHandshakeAck(byte[] data)
+    {
+        if (data.Length < 10) throw new InvalidDataException("HandshakeAck payload truncated.");
+        return (data[0], data[1] == 0, BitConverter.ToInt64(data, 2));
     }
 
     public static byte[] SerializeManifest(FileManifest manifest)

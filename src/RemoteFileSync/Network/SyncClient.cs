@@ -87,18 +87,44 @@ public sealed class SyncClient
         bool stopped = false;
 
         // 1. Send handshake
-        byte syncMode = (byte)((_options.Bidirectional ? 1 : 0) | (_options.DeleteEnabled ? 2 : 0));
-        var hsPayload = ProtocolHandler.SerializeHandshake(ProtocolHandler.ProtocolVersion, syncMode);
+        byte syncMode = (byte)((byte)_options.Mode
+                               | (_options.DeleteEnabled ? 4 : 0)
+                               | (_options.MirrorDeletes ? 8 : 0));
+        // Stamped immediately before the write so the round-trip ClockSkew halves is the
+        // network's latency and not our own frame-building time.
+        long clientSentTicks = DateTime.UtcNow.Ticks;
+        var hsPayload = ProtocolHandler.SerializeHandshake(
+            ProtocolHandler.ProtocolVersion, syncMode, clientSentTicks);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.Handshake, hsPayload, ct);
 
         // 2. Receive HandshakeAck
         var (ackType, ackData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+        long clientRecvTicks = DateTime.UtcNow.Ticks;
         if (ackType != MessageType.HandshakeAck)
         {
             _logger.Error($"Expected HandshakeAck, got {ackType}");
             return 3;
         }
-        var (serverVersion, accepted) = ProtocolHandler.DeserializeHandshakeAck(ackData);
+        byte serverVersion;
+        bool accepted;
+        long serverTicks;
+        try
+        {
+            (serverVersion, accepted, serverTicks) = ProtocolHandler.DeserializeHandshakeAck(ackData);
+        }
+        catch (InvalidDataException)
+        {
+            // A v2 server answers with a 2-byte ack, which the v3 length guard rejects before
+            // the version byte can be read — so the "server speaks v{n}" branch below would
+            // never run for the one case it was written for. Without this catch the exception
+            // escapes RunAsync entirely and the user sees Program.cs's generic
+            // "Fatal error: HandshakeAck payload truncated." with no idea what to do about it.
+            _logger.Error(
+                "Protocol mismatch: the server's HandshakeAck is shorter than protocol " +
+                $"v{ProtocolHandler.ProtocolVersion} requires, so the server is an older build. " +
+                "Upgrade both sides to the same build.");
+            return 2;
+        }
         if (serverVersion != ProtocolHandler.ProtocolVersion)
         {
             _logger.Error($"Protocol mismatch: server speaks v{serverVersion}, this build speaks " +
@@ -110,6 +136,21 @@ public sealed class SyncClient
         {
             _logger.Error("Server rejected the connection.");
             return 2;
+        }
+
+        // Measured once per session and reused by every cross-side timestamp comparison.
+        // Newest-wins resolution pits a client-stamped mtime against a server-stamped one; on
+        // machines whose clocks disagree that comparison picks the wrong winner and the loser's
+        // edit is overwritten with no conflict recorded.
+        var skew = ClockSkew.Measure(clientSentTicks, serverTicks, clientRecvTicks);
+        if (skew.IsSuspicious)
+        {
+            _logger.Warning(
+                $"Server clock differs from this machine by {skew.Offset.TotalSeconds:+0.0;-0.0} seconds " +
+                $"(threshold {SyncOptions.SuspiciousSkewSeconds}s; positive means the server is ahead). " +
+                "Two-way sync breaks ties by comparing the two sides' modification times, so a skew " +
+                "this large can select the older edit as the winner and overwrite the newer one. " +
+                "Fix NTP on both machines before relying on two-way sync.");
         }
 
         // Start database session
