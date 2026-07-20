@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using RemoteFileSync.Backup;
 using RemoteFileSync.Security;
@@ -338,5 +339,51 @@ public class ArchiveManagerTests : IDisposable
 
         Assert.Equal(0, result.SessionsRemoved);
         Assert.Equal(0L, result.BytesFreed);
+    }
+
+    [Fact]
+    public void Prune_RootCannotBeEnumerated_ReturnsEmptyResultInsteadOfThrowing()
+    {
+        // Regression for the IMPORTANT finding: Prune runs between StartSession (SyncClient.cs)
+        // and the try/finally that guarantees CompleteSession. An exception escaping the
+        // Directory.GetDirectories(rootFull) enumeration — permissions, an AV lock, or the
+        // TOCTOU against the Directory.Exists check just above it — would leak an open session
+        // row, reintroducing the bug commit 2266c93 fixed. Retention is explicitly best-effort
+        // (TryDeleteSession already treats a locked SESSION folder this way); this locks the
+        // same treatment for the archive ROOT itself.
+        var locked = Path.Combine(_archiveDir, "locked-root");
+        Directory.CreateDirectory(locked);
+
+        // Deny "list folder contents" for the current user on `locked` itself. Directory.Exists
+        // still reports true — it only reads the entry's attributes, not its contents — so this
+        // reaches Directory.GetDirectories rather than the earlier Directory.Exists guard.
+        RunIcacls(locked, "/deny", $"{Environment.UserName}:(RD)");
+        try
+        {
+            var result = ArchiveManager.Prune(locked, TimeSpan.FromDays(30), maxBytes: 0);
+
+            Assert.Equal(0, result.SessionsRemoved);
+            Assert.Equal(0L, result.BytesFreed);
+        }
+        finally
+        {
+            // Dispose() deletes _archiveDir recursively; a still-denied ACL would make that
+            // throw too, so access must be restored before the directory is ever removed.
+            RunIcacls(locked, "/remove:d", Environment.UserName);
+        }
+    }
+
+    private static void RunIcacls(string path, params string[] args)
+    {
+        var psi = new ProcessStartInfo("icacls")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add(path);
+        foreach (var arg in args) psi.ArgumentList.Add(arg);
+        using var proc = Process.Start(psi)!;
+        proc.WaitForExit();
     }
 }

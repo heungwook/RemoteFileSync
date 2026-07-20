@@ -1,4 +1,5 @@
 using RemoteFileSync.Backup;
+using RemoteFileSync.Models;
 using RemoteFileSync.Network;
 using RemoteFileSync.Transfer;
 
@@ -225,5 +226,56 @@ public class FileTransferTests : IDisposable
 
         Assert.True(result.Success);
         Assert.Equal("first version", File.ReadAllText(Path.Combine(destDir, "brand-new.txt")));
+    }
+
+    [Fact]
+    public async Task Receive_PeerLabelsPathClientOnly_StillArchivesPreExistingDestinationBytes()
+    {
+        // Regression for the CRITICAL finding: `action.Action` is a SyncPlanEntry deserialized
+        // straight off the wire from a peer we do not authenticate. SyncServer.cs and
+        // SyncClient.cs used to gate the archive call on it —
+        // `if (action.Action != SyncActionType.SendToServer) return true;` — so a hostile or
+        // buggy peer that mislabelled an overwrite as ClientOnly (or, symmetrically on the
+        // client side, ServerOnly) got the local file replaced with no restore point at all.
+        // The fix deleted that gate; TryArchive alone decides, from the LOCAL filesystem,
+        // whether there is anything to preserve. The onBeforeCommit below is exactly that fixed
+        // shape: it never consults `action`. If the deleted gate were reintroduced, this test
+        // would fail, because with action.Action == ClientOnly the gate returns true immediately
+        // and TryArchive is never called, so the archived-copy assertions below would fail.
+        var sourceDir = Path.Combine(_tempDir, "peerlabel_source");
+        var destDir = Path.Combine(_tempDir, "peerlabel_dest");
+        var archiveDir = Path.Combine(_tempDir, "peerlabel_archive");
+        Directory.CreateDirectory(sourceDir);
+        Directory.CreateDirectory(destDir);
+
+        var destFile = Path.Combine(destDir, "important.txt");
+        File.WriteAllText(destFile, "OLD VERSION");
+        File.WriteAllText(Path.Combine(sourceDir, "important.txt"), "NEW VERSION");
+
+        var archive = new ArchiveManager(destDir, archiveDir,
+                                          new DateTime(2026, 7, 19, 14, 30, 52, DateTimeKind.Utc));
+
+        // The peer's label for this path, deserialized from syncPlan. ClientOnly means "no
+        // previous version, nothing to protect" — a claim about our filesystem the peer has no
+        // authority to make, and here it is false: important.txt already exists at destDir.
+        var action = new SyncPlanEntry(SyncActionType.ClientOnly, "important.txt");
+        Assert.Equal(SyncActionType.ClientOnly, action.Action);
+
+        using var pipeStream = new MemoryStream();
+        var sender = new FileTransferSender(sourceDir, blockSize: 1024);
+        var receiver = new FileTransferReceiver(destDir);
+        await sender.SendFileAsync(pipeStream, fileId: 1, relativePath: "important.txt", CancellationToken.None);
+        pipeStream.Position = 0;
+
+        var result = await receiver.ReceiveFileAsync(pipeStream, CancellationToken.None,
+            onBeforeCommit: p =>
+                archive.TryArchive(p, ArchiveReason.Overwritten, removeOriginal: false)
+                    != ArchiveOutcome.Failed);
+
+        Assert.True(result.Success);
+        Assert.Equal("NEW VERSION", File.ReadAllText(destFile));
+        var archived = Path.Combine(archiveDir, archive.SessionFolderName, "overwritten", "important.txt");
+        Assert.True(File.Exists(archived));
+        Assert.Equal("OLD VERSION", File.ReadAllText(archived));
     }
 }

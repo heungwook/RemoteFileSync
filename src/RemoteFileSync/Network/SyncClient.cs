@@ -431,15 +431,19 @@ public sealed class SyncClient
                     result = await receiver.ReceiveFileAsync(stream, ct,
                         onBeforeCommit: p =>
                         {
-                            // Not an overwrite of a file we already hold (ServerOnly pull):
-                            // there is no previous version, so nothing to protect.
-                            if (action.Action != SyncActionType.SendToClient) return true;
-
+                            // `action.Action` is the peer's label for this path, deserialized
+                            // from syncPlan — not a fact about our filesystem, and it is also
+                            // decided from a manifest scanned earlier in the run, so a file the
+                            // user creates locally mid-sync would look ServerOnly to the plan
+                            // even though it now exists here. A hostile or buggy peer, or that
+                            // TOCTOU window, must not skip the archive: TryArchive itself checks
+                            // the LOCAL file and returns NothingToArchive when there truly is
+                            // nothing to protect, so gating on the peer's label instead would let
+                            // either case get a local file overwritten with no archived copy.
                             var outcome = archive.TryArchive(p, ArchiveReason.Overwritten, removeOriginal: false);
                             if (outcome == ArchiveOutcome.Failed)
                                 _logger.Error($"Pre-overwrite archive failed for {p}; " +
                                               "refusing to overwrite the local copy.");
-                            // NothingToArchive: no local file to preserve, commit is safe.
                             return outcome != ArchiveOutcome.Failed;
                         });
                 }

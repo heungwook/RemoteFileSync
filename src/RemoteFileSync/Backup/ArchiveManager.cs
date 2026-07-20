@@ -50,8 +50,9 @@ public sealed class ArchiveManager
     /// <summary>
     /// Copies the file into this session's archive under <paramref name="reason"/>, optionally
     /// deleting the original afterwards. Returns false if the path is not contained by the sync
-    /// root, or the file does not exist. Callers MUST NOT run a destructive step on a discarded
-    /// result: PathGuard fails closed on transient IO, so false does not imply "nothing to do".
+    /// root, the file does not exist, or the copy itself failed (locked file, full disk — see
+    /// <see cref="TryArchive"/>). Callers MUST NOT run a destructive step on a discarded result:
+    /// PathGuard fails closed on transient IO, so false does not imply "nothing to do".
     /// </summary>
     public bool Archive(string relativePath, ArchiveReason reason, bool removeOriginal)
         => TryArchive(relativePath, reason, removeOriginal) == ArchiveOutcome.Archived;
@@ -94,8 +95,10 @@ public sealed class ArchiveManager
 
             // Everything from here down touches the filesystem. An exception escaping this
             // method would unwind ReceiveFileAsync's onBeforeCommit callback, which is invoked
-            // outside its own try, so the caller would get no FileReceiveResult at all and the
-            // staging file would be stranded. Report the failure instead of throwing it.
+            // inside the try whose finally sweeps the staging file (FileTransfer.cs:177 vs
+            // :193-198) — so staging is not at risk — but the exception itself would still
+            // propagate out of ReceiveFileAsync, and the caller would get no FileReceiveResult
+            // at all. Report the failure instead of throwing it.
             try
             {
                 Directory.CreateDirectory(destDir);
@@ -135,7 +138,11 @@ public sealed class ArchiveManager
     /// <paramref name="keepAge"/>, then drops the oldest survivors until the total falls to
     /// <paramref name="maxBytes"/>. <c>keepAge == TimeSpan.Zero</c> disables the age rule
     /// (--archive-keep-days 0 = keep forever); <c>maxBytes &lt;= 0</c> disables the size cap.
-    /// Whole session folders only — a half-emptied session is not a restore point.
+    /// Whole session folders only — a half-emptied session is not a restore point. This is a
+    /// best-effort guarantee, not an atomic one: TryDeleteSession's underlying
+    /// Directory.Delete(recursive: true) can remove several files and then hit one that is
+    /// locked, in which case it reports the session as a survivor rather than removed, but the
+    /// folder on disk is already missing whatever it deleted before the failure.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="keepAge"/> is negative. Zero means "keep forever"; a negative age is a
@@ -156,8 +163,18 @@ public sealed class ArchiveManager
         var rootFull = Path.GetFullPath(archiveRoot);
         if (!Directory.Exists(rootFull)) return new PruneResult(0, 0);
 
+        // Prune runs between StartSession and the try/finally that guarantees CompleteSession
+        // (SyncClient.cs), so an exception here would leak an open session row. Retention is
+        // best-effort by design (see TryDeleteSession below), and the TOCTOU against the
+        // Directory.Exists check above — the folder can vanish or lose permissions between the
+        // two calls — must degrade the same way a locked session folder does, not abort the sync.
+        string[] dirs;
+        try { dirs = Directory.GetDirectories(rootFull); }
+        catch (IOException) { return new PruneResult(0, 0); }
+        catch (UnauthorizedAccessException) { return new PruneResult(0, 0); }
+
         var sessions = new List<(DateTime Start, string Path, long Bytes)>();
-        foreach (var dir in Directory.GetDirectories(rootFull))
+        foreach (var dir in dirs)
         {
             // Only folders we created are eligible. A legacy yyyyMMdd backup tree, or anything a
             // user dropped into the archive root, fails the parse and is left strictly alone —
@@ -221,7 +238,11 @@ public sealed class ArchiveManager
 
     /// <summary>
     /// Retention is best-effort: a locked or unreadable session folder must not fail the sync
-    /// that is about to run, since Prune executes before any transfer.
+    /// that is about to run, since Prune executes before any transfer. That best-effort promise
+    /// is not just about the try/catch here — Directory.Delete(recursive: true) is not atomic,
+    /// so a failure partway through leaves the session folder missing whatever it removed before
+    /// hitting the locked entry. Prune's "whole session folders only" guarantee is therefore
+    /// best-effort against this kind of OS-level partial failure, not a hard invariant.
     /// </summary>
     private static bool TryDeleteSession(string sessionPath)
     {
