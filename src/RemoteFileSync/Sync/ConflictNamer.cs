@@ -28,6 +28,16 @@ public static class ConflictNamer
     /// <summary>
     /// <paramref name="ordinal"/> 1 produces the bare name; 2 and above append "-{ordinal}" so a
     /// second conflict on the same path within the same second does not overwrite the first.
+    ///
+    /// Injective in <paramref name="relativePath"/> for a fixed (sessionStartUtc, losingSide,
+    /// ordinal): <see cref="TryParse"/> is Compose's left inverse (see its round-trip tests), and
+    /// a function with a left inverse cannot map two different inputs to the same output. This is
+    /// load-bearing, not incidental: <see cref="ConflictKeepBothExecutor.Expand"/> calls
+    /// <see cref="MakeUnique"/> once per conflict in the plan, and MakeUnique only probes THIS
+    /// call's names against the filesystem — it does not also check against names Expand already
+    /// chose earlier in the same call, none of which are written to disk until the rename pass
+    /// runs later. Two conflicts in one session can only avoid colliding with each other because
+    /// two distinct original paths are guaranteed to compose to two distinct names.
     /// </summary>
     public static string Compose(string relativePath, DateTime sessionStartUtc, string losingSide, int ordinal = 1)
     {

@@ -465,6 +465,21 @@ public sealed class SyncClient
                 _progress.WriteFileEnd(action.RelativePath, success: true, thread: 0);
                 _db?.MarkSynced(action.RelativePath, sfi.Length, sfi.LastWriteTimeUtc, sessionId, "to_server");
             }
+            catch (Exception ex) when (IsPeerDisconnect(ex))
+            {
+                // The server closed the socket out from under us — most likely one of its own
+                // conflict-plan guards rejected the plan and returned without telling us (it has
+                // no frame for "I'm aborting" once it has already read the plan). Every remaining
+                // WriteMessageAsync/ReadMessageAsync on this stream would fail the same way, so
+                // this is terminal exactly like the desynced flag above: stop the phase here
+                // instead of grinding through every remaining file with one logged error each and
+                // then throwing uncaught out of the delete phase below.
+                _logger.Error($"Peer closed the connection while sending {action.RelativePath} " +
+                              $"({ex.GetType().Name}: {ex.Message}). The server likely rejected " +
+                              "the sync plan; aborting.");
+                desynced = true;
+                break;
+            }
             catch (Exception ex)
             {
                 _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}");
@@ -477,7 +492,7 @@ public sealed class SyncClient
         {
             // Every later phase reads from the same misaligned stream, so this is terminal.
             skippedFiles++;
-            _progress.WriteError("Protocol desync during transfer phase; aborting sync.", fatal: true);
+            _progress.WriteError("Protocol desync or peer disconnect during transfer phase; aborting sync.", fatal: true);
             return 3;   // inside the try — the finally still calls CompleteSession
         }
 
@@ -698,4 +713,19 @@ public sealed class SyncClient
             }
         }
     }
+
+    /// <summary>
+    /// True when <paramref name="ex"/> means the socket itself is gone, as opposed to a
+    /// per-file failure (missing local file, checksum mismatch, sharing violation) that leaves
+    /// the connection usable for the next file in the loop. EndOfStreamException is the one
+    /// ProtocolHandler.ReadExactAsync raises itself, always for "the peer closed its end"; a
+    /// SocketException carried as IOException.InnerException is NetworkStream's wrapping of the
+    /// same condition on a write. A bare IOException is deliberately excluded — that is also
+    /// what a locked or unreadable source file throws, and misclassifying it here would abort
+    /// the whole transfer phase over one file instead of skipping just that file.
+    /// </summary>
+    private static bool IsPeerDisconnect(Exception ex) =>
+        ex is EndOfStreamException
+        || ex is SocketException
+        || (ex is IOException { InnerException: SocketException });
 }

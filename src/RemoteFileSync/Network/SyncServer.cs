@@ -250,13 +250,16 @@ public sealed class SyncServer
                 return 4;
             }
 
-            // Landing a conflict name on top of an existing local file removes that file. The
-            // plan comes from a peer we do not authenticate, so a plan whose conflict names all
-            // point at real local files would be a way to empty this folder without ever sending
-            // a DeleteFile frame — bypassing both the negotiated delete flag and the budget the
-            // server enforces on DeleteOnServer. Hold squatter removal to the same two rules.
-            // Both `occupied` and `serverManifest.Count` are measured from THIS machine's own
-            // scan; nothing the peer sent is allowed to size the blast radius.
+            // Landing a conflict name on top of an existing local file replaces that file, which
+            // is a deletion in every way that matters. The plan comes from a peer we do not
+            // authenticate, so this guard bounds THAT case to the same two rules DeleteOnServer
+            // obeys: the negotiated delete flag and the budget. It does NOT bound conflict
+            // renames onto a FREE name — a hostile plan can still rename every file in the tree
+            // without tripping either rule, since nothing here is occupied. That is tolerated
+            // rather than closed because it is recoverable, not destructive: the original
+            // survives under the new name, plus a Conflict archive copy from the pre-rename
+            // snapshot below. Both `occupied` and `serverManifest.Count` are measured from THIS
+            // machine's own scan; nothing the peer sent is allowed to size the blast radius.
             int occupied = ConflictKeepBothExecutor.CountOccupiedTargets(
                 syncPlan, ConflictNamer.ServerSide, _options.Folder);
             if (occupied > 0 && !deleteEnabled)

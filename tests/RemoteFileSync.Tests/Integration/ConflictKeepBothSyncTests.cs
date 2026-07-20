@@ -111,6 +111,85 @@ public class ConflictKeepBothSyncTests : IDisposable
         return clientResult;
     }
 
+    /// <summary>
+    /// Mirror of <see cref="RunTwoWaySyncExpectingClientAbortAsync"/>: here the SERVER is the one
+    /// whose conflict rename fails and returns 4, after it has already read the client's plan.
+    /// Unlike the client-abort direction, the server's own return path does no further network
+    /// I/O, so its task resolves normally — it is the CLIENT that is left mid-plan on a socket
+    /// the server just closed, which is exactly the path SyncClient.cs must fail cleanly through.
+    /// </summary>
+    private async Task<(int clientResult, int serverResult)> RunTwoWaySyncExpectingServerAbortAsync(SyncDatabase db)
+    {
+        int port = GetFreePort();
+        var serverOpts = new SyncOptions
+        {
+            IsServer = true, Once = true, Port = port, Folder = _serverDir,
+            Mode = SyncMode.TwoWay, DeleteEnabled = true,
+        };
+        var clientOpts = new SyncOptions
+        {
+            IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir,
+            Mode = SyncMode.TwoWay, DeleteEnabled = true,
+        };
+
+        using var serverLogger = new SyncLogger(false, null);
+        using var clientLogger = new SyncLogger(false, null);
+
+        var server = new SyncServer(serverOpts, serverLogger);
+        var client = new SyncClient(clientOpts, clientLogger, db: db);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var serverTask = server.RunAsync(cts.Token);
+        await Task.Delay(500);
+        int clientResult = await client.RunAsync(cts.Token);
+        int serverResult = await serverTask;
+        return (clientResult, serverResult);
+    }
+
+    [Fact]
+    public async Task ServerConflictRenameFailure_ClientReportsCleanErrorInsteadOfCrashing()
+    {
+        // Mirror of ConflictRenameFailure_AbortsAboveTheAncestorWriteBlock, but the LOSING side
+        // is the server: the server's own ApplyLocalRenames fails and SyncServer.cs returns 4
+        // having already read the client's plan (SyncServer.cs:294). Nothing tells the client —
+        // there is no frame for "I'm aborting" once the plan has been read — so its stream just
+        // goes dead the next time it tries to use it. Before the client-side fix this either
+        // spammed one logged error per remaining file and then threw WriteMessageAsync's
+        // exception uncaught out of the delete phase, or hung; now it must stop the phase and
+        // return a clean non-zero exit code through the normal path.
+        var baseTs = new DateTime(2026, 3, 26, 10, 0, 0, DateTimeKind.Utc);
+        var dbPath = Path.Combine(_dbDir, "server-rename-abort.db");
+
+        // Run 1 establishes an ancestor row for report.txt.
+        CreateFileWithTimestamp(_clientDir, "report.txt", "original", baseTs);
+        CreateFileWithTimestamp(_serverDir, "report.txt", "original", baseTs);
+        using (var db = new SyncDatabase(dbPath))
+            await RunTwoWaySyncAsync(db);
+
+        // Client copy is newer this time, so the SERVER owns the rename and the SERVER loses.
+        CreateFileWithTimestamp(_clientDir, "report.txt", "client edit", baseTs.AddHours(2));
+        CreateFileWithTimestamp(_serverDir, "report.txt", "server edit", baseTs.AddHours(1));
+
+        // Hold the server's losing copy open with FileShare.None so File.Move throws IOException
+        // inside the server's ApplyLocalRenames — the same technique the client-side abort test
+        // uses, aimed at the other peer's disk.
+        using (var locked = new FileStream(Path.Combine(_serverDir, "report.txt"),
+                   FileMode.Open, FileAccess.Read, FileShare.None))
+        using (var db = new SyncDatabase(dbPath))
+        {
+            var (clientResult, serverResult) = await RunTwoWaySyncExpectingServerAbortAsync(db);
+            Assert.Equal(4, serverResult);
+            // 3 = the client's own "peer disconnected mid-plan" exit path. Anything else means
+            // either the crash the review reported (an unhandled exception aborts the await
+            // above before clientResult is even assigned) or a silent success that lost data.
+            Assert.Equal(3, clientResult);
+        }
+
+        // Nothing was destroyed: the failed rename left the server's file exactly where it was.
+        Assert.Equal("server edit", File.ReadAllText(Path.Combine(_serverDir, "report.txt")));
+        Assert.Empty(Directory.GetFiles(_serverDir, "report.conflict-*"));
+    }
+
     [Fact]
     public async Task TwoWayConflict_ClientCopyLosesWhenServerCopyIsNewer()
     {
@@ -181,6 +260,70 @@ public class ConflictKeepBothSyncTests : IDisposable
         Assert.Equal(Path.GetFileName(clientLosers[0]), Path.GetFileName(serverLosers[0]));
         Assert.Equal("server edit", File.ReadAllText(clientLosers[0]));
         Assert.Equal("server edit", File.ReadAllText(serverLosers[0]));
+    }
+
+    [Fact]
+    public async Task TwoWayConflict_TwoConflictsInOneSession_BothDirectionsSurviveTogether()
+    {
+        // The single-conflict tests above each exercise one loser direction in isolation. A
+        // desync bug that only shows up once the plan carries MORE than one ConflictKeepBoth
+        // entry — e.g. an off-by-one in which peer reads which frame — would pass both of those
+        // and still corrupt a real multi-file sync. Mixing a client-loses and a server-loses
+        // conflict in the SAME plan is the smallest session that can catch that: it is also the
+        // only combination where the two peers execute their local rename passes over DIFFERENT
+        // subsets of the same plan (see ConflictKeepBothExecutor.ApplyLocalRenames's `side`
+        // filter) before either side's transfer phase begins.
+        var baseTs = new DateTime(2026, 3, 26, 10, 0, 0, DateTimeKind.Utc);
+        var dbPath = Path.Combine(_dbDir, "conflict-multi.db");
+
+        // Run 1 establishes ancestor rows for both files.
+        CreateFileWithTimestamp(_clientDir, "report.txt", "original", baseTs);
+        CreateFileWithTimestamp(_serverDir, "report.txt", "original", baseTs);
+        CreateFileWithTimestamp(_clientDir, "notes.md", "original", baseTs);
+        CreateFileWithTimestamp(_serverDir, "notes.md", "original", baseTs);
+        using (var db = new SyncDatabase(dbPath))
+            await RunTwoWaySyncAsync(db);
+
+        // report.txt: server edit is newer, so the CLIENT copy loses.
+        CreateFileWithTimestamp(_clientDir, "report.txt", "client edit", baseTs.AddHours(1));
+        CreateFileWithTimestamp(_serverDir, "report.txt", "server edit", baseTs.AddHours(2));
+        // notes.md: client edit is newer, so the SERVER copy loses.
+        CreateFileWithTimestamp(_clientDir, "notes.md", "client edit", baseTs.AddHours(2));
+        CreateFileWithTimestamp(_serverDir, "notes.md", "server edit", baseTs.AddHours(1));
+
+        using (var db = new SyncDatabase(dbPath))
+        {
+            var (clientResult, serverResult) = await RunTwoWaySyncAsync(db);
+            Assert.Equal(0, clientResult);
+            Assert.Equal(0, serverResult);
+        }
+
+        // Both winners landed under their canonical name on both peers.
+        Assert.Equal("server edit", File.ReadAllText(Path.Combine(_clientDir, "report.txt")));
+        Assert.Equal("server edit", File.ReadAllText(Path.Combine(_serverDir, "report.txt")));
+        Assert.Equal("client edit", File.ReadAllText(Path.Combine(_clientDir, "notes.md")));
+        Assert.Equal("client edit", File.ReadAllText(Path.Combine(_serverDir, "notes.md")));
+
+        // Both losers survived under the SAME renamed name on both peers.
+        var reportClientLosers = Directory.GetFiles(_clientDir, "report.conflict-*-client.txt");
+        var reportServerLosers = Directory.GetFiles(_serverDir, "report.conflict-*-client.txt");
+        Assert.Single(reportClientLosers);
+        Assert.Single(reportServerLosers);
+        Assert.Equal(Path.GetFileName(reportClientLosers[0]), Path.GetFileName(reportServerLosers[0]));
+        Assert.Equal("client edit", File.ReadAllText(reportClientLosers[0]));
+        Assert.Equal("client edit", File.ReadAllText(reportServerLosers[0]));
+
+        var notesClientLosers = Directory.GetFiles(_clientDir, "notes.conflict-*-server.md");
+        var notesServerLosers = Directory.GetFiles(_serverDir, "notes.conflict-*-server.md");
+        Assert.Single(notesClientLosers);
+        Assert.Single(notesServerLosers);
+        Assert.Equal(Path.GetFileName(notesClientLosers[0]), Path.GetFileName(notesServerLosers[0]));
+        Assert.Equal("server edit", File.ReadAllText(notesClientLosers[0]));
+        Assert.Equal("server edit", File.ReadAllText(notesServerLosers[0]));
+
+        // All four resulting files, on both sides — nothing was skipped, duplicated, or blended.
+        Assert.Equal(4, Directory.GetFiles(_clientDir).Length);
+        Assert.Equal(4, Directory.GetFiles(_serverDir).Length);
     }
 
     [Fact]
