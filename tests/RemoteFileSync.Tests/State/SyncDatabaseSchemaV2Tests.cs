@@ -169,16 +169,24 @@ public sealed class SyncDatabaseSchemaV2Tests : IDisposable
     }
 
     [Fact]
-    public void MarkSynced_Shim_StampsOneSidesValuesOntoBothSides()
+    public void MarkSynced_MigrationShim_StampsOneSidesValuesOntoBothSides()
     {
-        // Characterisation test, NOT an endorsement. The v1 shim has exactly one honest
-        // caller (MigrateFromBinary, whose source genuinely records a single size+mtime).
-        // SyncClient.cs:187-194 is the dishonest caller: it feeds one side's manifest entry
-        // in for a Skip, fabricating a peer state that never existed, and the Push/Pull
-        // tables then read that row as "the peer had it" and delete. Phase 6 owns
-        // SyncClient.cs:185-206 and must replace that call with a both-sides-present
-        // UpsertSynced / MarkSkipped split (CONTRACT.md correction 6). If this test ever
-        // changes, that fix has landed or regressed — either way, look at SyncClient.
+        // Characterisation test, NOT an endorsement: it pins what the v1 shim does, and says
+        // nothing about whether any given caller is entitled to that behaviour.
+        //
+        // The dishonest caller this test was written to watch — the skip loop in SyncClient,
+        // which fed one side's manifest entry in for a Skip and so fabricated a peer state that
+        // never existed — is GONE as of Phase 6. It now writes UpsertSynced only when both
+        // manifests hold the path, each column carrying its own side's size and mtime, and
+        // MarkSkipped otherwise (CONTRACT.md correction 6). The end-to-end proof that the
+        // fabricated row no longer appears lives in
+        // tests/RemoteFileSync.Tests/Network/AncestorRowWriteTests.cs, not here: this test
+        // exercises SyncDatabase directly, so no change in SyncClient can ever move it.
+        //
+        // Remaining callers of the shim, none of which fabricate consensus:
+        //   - MigrateFromBinary, whose v1 source genuinely records a single size+mtime;
+        //   - the two post-transfer stamps in SyncClient, which run only after the file has
+        //     actually been copied, so both sides really do hold those bytes.
         using var db = new SyncDatabase(_dbPath);
         var session = db.StartSession("push", "/folder", "host", 8765);
         var mtime = new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc);

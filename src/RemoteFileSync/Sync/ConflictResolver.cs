@@ -6,6 +6,11 @@ public static class ConflictResolver
 {
     private static readonly TimeSpan TimestampTolerance = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// Newest wins, ties broken by size. Only valid on the no-ancestor path: with no record of
+    /// what the two sides last agreed on, the timestamp is the only signal available. Callers
+    /// must normalise the server entry for clock skew before calling.
+    /// </summary>
     public static SyncActionType Resolve(FileEntry clientEntry, FileEntry serverEntry)
     {
         var timeDiff = clientEntry.LastModifiedUtc - serverEntry.LastModifiedUtc;
@@ -23,18 +28,7 @@ public static class ConflictResolver
         return SyncActionType.Skip;
     }
 
-    /// <summary>
-    /// Resolves the action when a file was deleted on one side and still exists on the other.
-    /// Case 1: Surviving file untouched (modTime ≤ lastSyncUtc + tolerance) → propagate deletion.
-    /// Case 2: Surviving file modified (modTime > lastSyncUtc + tolerance) → restore (copy to deleting side).
-    /// </summary>
-    public static SyncActionType ResolveDeleteConflict(bool deletedOnClient, FileEntry survivingEntry, DateTime lastSyncUtc)
-    {
-        bool untouched = survivingEntry.LastModifiedUtc <= lastSyncUtc + TimestampTolerance;
-
-        if (deletedOnClient)
-            return untouched ? SyncActionType.DeleteOnServer : SyncActionType.SendToClient;
-        else
-            return untouched ? SyncActionType.DeleteOnClient : SyncActionType.SendToServer;
-    }
+    // ResolveDeleteConflict was removed: it decided whether a surviving file had been edited by
+    // comparing its mtime against the session-wide LastSynced, which deleted any file whose stamp
+    // merely looked older. SyncEngine now answers that from the per-side AncestorRow.
 }

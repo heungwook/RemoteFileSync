@@ -194,9 +194,16 @@ public sealed class SyncClient
         _progress.WriteManifest("remote", serverManifest.Count, serverManifest.Entries.Sum(e => e.FileSize));
 
         // 6. Compute sync plan and send
-        var syncPlan = (_db != null)
-            ? SyncEngine.ComputePlan(clientManifest, serverManifest, _options.Bidirectional, _db, _options.DeleteEnabled)
-            : SyncEngine.ComputePlan(clientManifest, serverManifest, _options.Bidirectional, previousState, _options.DeleteEnabled);
+        // A null ancestor table is the honest signal for "we do not know what changed", and the
+        // engine refuses to emit any deletion on that path.
+        // `skew` is the measured client-vs-server clock offset from the v3 handshake above.
+        // Passing ClockSkew.None here would leave a peer with a fast clock winning every
+        // newest-wins comparison forever, re-transferring the same bytes on every run.
+        IReadOnlyDictionary<string, AncestorRow>? ancestor = _db?.LoadAll();
+        var planResult = SyncEngine.ComputePlan(
+            clientManifest, serverManifest, _options.Mode, ancestor,
+            _options.DeleteEnabled, _options.MirrorDeletes, skew);
+        var syncPlan = planResult.Entries;
 
         // A path excluded by local filters must be invisible: never transferred, and above all
         // never deleted. Its absence from the manifest is otherwise indistinguishable from a
@@ -228,30 +235,6 @@ public sealed class SyncClient
         _progress.WritePlan(transferCount, deleteCount, skipCount, plannedBytes);
         var planBytes = ProtocolHandler.SerializeSyncPlan(syncPlan);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncPlan, planBytes, ct);
-
-        if (_db != null)
-        {
-            foreach (var skip in syncPlan.Where(p => p.Action == SyncActionType.Skip))
-            {
-                // Use client manifest entry (or server as fallback) to record in files table so
-                // deletion can be detected on the next run.
-                var entry = clientManifest.Get(skip.RelativePath)
-                         ?? serverManifest.Get(skip.RelativePath);
-                if (entry != null)
-                    _db.MarkSynced(skip.RelativePath, entry.FileSize, entry.LastModifiedUtc, sessionId, "skipped");
-                else
-                    _db.MarkSkipped(skip.RelativePath, sessionId);
-            }
-
-            // Retire tracked rows for files absent on both sides. Left as 'exists', a later
-            // restore on one side is resolved as a deletion on the other.
-            foreach (var fs in _db.GetAllTrackedFiles())
-            {
-                if (fs.Status != "exists") continue;
-                if (clientManifest.Contains(fs.Path) || serverManifest.Contains(fs.Path)) continue;
-                _db.MarkDeleted(fs.Path, sessionId, "absent on both sides; retiring tracked row");
-            }
-        }
 
         // Retention runs here, before the first archive write and before the first transfer,
         // so the session folder this run is about to create can never be a prune candidate.
@@ -314,6 +297,60 @@ public sealed class SyncClient
                         return 4;
                     }
                 }
+            }
+        }
+
+        // Moved below both delete guards. This block used to run above them, so an exit-4 abort
+        // still committed its rows; the next run then planned fewer deletions, slipped under the
+        // same threshold, and executed them against state that was never confirmed by a completed
+        // sync. This is not the final position: Phase 7 adds a conflict-rename pass at the
+        // '// 7. Send files to server' landmark that can also return 4, and Phase 7 moves this
+        // block below that pass. Until then, only the delete guards are known to precede it.
+        if (_db != null && ancestor != null)
+        {
+            // Paths the local filters excluded were already dropped from syncPlan above. Drop
+            // them from the side channels too: an excluded path must stay invisible, and
+            // reporting a resurrection for one names a file the user took out of scope.
+            planResult.Resurrections.RemoveAll(r => !scanner.IsIncluded(r.Path));
+            planResult.Conflicts.RemoveAll(c => !scanner.IsIncluded(c.Path));
+
+            foreach (var skip in syncPlan.Where(p => p.Action == SyncActionType.Skip))
+            {
+                var skippedOnClient = clientManifest.Get(skip.RelativePath);
+                var skippedOnServer = serverManifest.Get(skip.RelativePath);
+
+                if (skippedOnClient != null && skippedOnServer != null)
+                {
+                    // An ancestor row asserts "both sides held this file and agreed", so it may
+                    // only be written when both sides actually have it, each column carrying its
+                    // own side's size and mtime. The old code fell back to
+                    // `client ?? server` and stamped one side's values into both columns, which
+                    // manufactured a peer state that never existed: in Push a server-only file
+                    // was recorded as "the client had it too" and run 2 deleted it, and in Pull
+                    // the mirror deleted the user's own local-only files.
+                    _db.UpsertSynced(skip.RelativePath,
+                        skippedOnClient.FileSize, skippedOnClient.LastModifiedUtc.Ticks,
+                        skippedOnServer.FileSize, skippedOnServer.LastModifiedUtc.Ticks,
+                        sessionId, "skipped");
+                }
+                else
+                {
+                    // One-sided skip: Push leaving a server-only file alone, or Pull leaving a
+                    // client-only file alone. Record that we saw and skipped it, without
+                    // claiming the peer ever had it.
+                    _db.MarkSkipped(skip.RelativePath, sessionId);
+                }
+            }
+
+            // Retire rows for files now absent on both sides. Left as 'exists', a later restore
+            // on one side is resolved as a deletion on the other. The snapshot loaded before
+            // planning is the right input here: it is precisely the last state both sides agreed
+            // on, and re-reading the table would also pick up the rows just written above.
+            foreach (var row in ancestor.Values)
+            {
+                if (row.Status != "exists") continue;
+                if (clientManifest.Contains(row.Path) || serverManifest.Contains(row.Path)) continue;
+                _db.Tombstone(row.Path, sessionId, "absent on both sides; retiring tracked row");
             }
         }
 
