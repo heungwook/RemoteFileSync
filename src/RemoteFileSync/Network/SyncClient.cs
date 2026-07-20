@@ -213,25 +213,40 @@ public sealed class SyncClient
         {
             _logger.Info($"Ignoring {filteredOut.Count} path(s) excluded by local filters.");
             syncPlan = syncPlan.Where(p => scanner.IsIncluded(p.RelativePath)).ToList();
-            if (_db != null)
-            {
-                foreach (var entry in filteredOut)
-                    _db.MarkDeleted(entry.RelativePath, sessionId, "excluded by filters; retiring tracked row");
-            }
+            // The row retirement that used to happen here moved down beside the ancestor writes,
+            // so that every `return 4` in this method precedes all database mutation.
         }
 
+        // Every ConflictKeepBoth becomes a frame-free local rename plus one transfer in each
+        // direction, and this MUST happen before the plan is serialised: both peers execute the
+        // list they are handed, so a conflict the server has to interpret for itself is a desync
+        // waiting to happen. sessionStartUtc is the session's single clock read, so the conflict
+        // name and the archive session folder carry the same timestamp.
+        var conflictExpansion = ConflictKeepBothExecutor.Expand(
+            syncPlan, clientManifest, serverManifest, skew, sessionStartUtc, _options.Folder);
+        syncPlan = conflictExpansion.Entries;
+
+        // ConflictKeepBoth entries move no bytes, so they are not transfers: counting them would
+        // make the GUI's progress bar overshoot and never reach 100%.
         var transferCount = syncPlan.Count(p => p.Action != SyncActionType.Skip
-            && p.Action != SyncActionType.DeleteOnServer && p.Action != SyncActionType.DeleteOnClient);
+            && p.Action != SyncActionType.DeleteOnServer && p.Action != SyncActionType.DeleteOnClient
+            && p.Action != SyncActionType.ConflictKeepBoth);
         var deleteCount = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer || p.Action == SyncActionType.DeleteOnClient);
         var skipCount = syncPlan.Count(p => p.Action == SyncActionType.Skip);
         var deleteSummary = deleteCount > 0 ? $", {deleteCount} delete" : "";
-        _logger.Info($"Sync plan: {transferCount} transfers{deleteSummary}, {skipCount} skipped");
+        var conflictSummary = conflictExpansion.RenamedTo.Count > 0
+            ? $", {conflictExpansion.RenamedTo.Count} conflict" : "";
+        _logger.Info($"Sync plan: {transferCount} transfers{deleteSummary}{conflictSummary}, {skipCount} skipped");
 
         // Total bytes the client will push, so the GUI can show real progress rather than
-        // guessing from file counts.
+        // guessing from file counts. A conflict copy is not in the manifest yet — it is named
+        // after a file that is — so fall back to the original's size rather than counting zero.
         long plannedBytes = syncPlan
             .Where(p => p.Action is SyncActionType.SendToServer or SyncActionType.ClientOnly)
-            .Sum(p => clientManifest.Get(p.RelativePath)?.FileSize ?? 0);
+            .Sum(p => clientManifest.Get(p.RelativePath)?.FileSize
+                   ?? (ConflictNamer.TryParse(p.RelativePath, out var origin, out _)
+                        ? clientManifest.Get(origin)?.FileSize ?? 0
+                        : 0));
         _progress.WritePlan(transferCount, deleteCount, skipCount, plannedBytes);
         var planBytes = ProtocolHandler.SerializeSyncPlan(syncPlan);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncPlan, planBytes, ct);
@@ -300,12 +315,58 @@ public sealed class SyncClient
             }
         }
 
-        // Moved below both delete guards. This block used to run above them, so an exit-4 abort
-        // still committed its rows; the next run then planned fewer deletions, slipped under the
-        // same threshold, and executed them against state that was never confirmed by a completed
-        // sync. This is not the final position: Phase 7 adds a conflict-rename pass at the
-        // '// 7. Send files to server' landmark that can also return 4, and Phase 7 moves this
-        // block below that pass. Until then, only the delete guards are known to precede it.
+        // 6b. Conflict renames. Frame-free, and BEFORE any transfer: this is the only step where
+        // the two peers do different work, so it must finish on both sides before a single file
+        // frame moves or their transfer sets stop lining up. `archive` is the session's one
+        // ArchiveManager — a second instance here would fork the restore point across two session
+        // folders and shadow the outer local.
+        //
+        // This block sits ABOVE every database write that follows, deliberately: it can return 4,
+        // and an aborted run must not leave committed rows behind.
+        var conflictEntries = syncPlan.Where(p => p.Action == SyncActionType.ConflictKeepBoth).ToList();
+        if (conflictEntries.Count > 0)
+        {
+            var conflictOutcome = ConflictKeepBothExecutor.ApplyLocalRenames(
+                syncPlan, ConflictNamer.ClientSide, _options.Folder, archive);
+
+            // Fatal, not skippable: the plan already promised the peer a transfer under the
+            // conflict name, and a sender that cannot open its source throws while compressing or
+            // hashing it — both before the first frame is written — leaving the peer blocked on a
+            // FileStart that never arrives.
+            if (conflictOutcome.Failures.Count > 0)
+            {
+                var msg = $"Refusing to sync: conflict rename failed for {conflictOutcome.Failures.Count} " +
+                          $"path(s): {string.Join("; ", conflictOutcome.Failures)}";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            // The rename itself succeeded; only the belt-and-braces pre-rename snapshot did not.
+            // Warn rather than abort — the bytes are intact under the new name.
+            foreach (var path in conflictOutcome.NotArchived)
+                _logger.Warning($"Conflict copy of {path} was renamed but could not be archived first.");
+
+            foreach (var entry in conflictEntries)
+            {
+                if (!ConflictNamer.TryParse(entry.RelativePath, out var original, out var losingSide)) continue;
+                _logger.Info($"[!] Conflict on {original}: {losingSide} copy kept as {entry.RelativePath}");
+            }
+        }
+
+        // Retire rows for paths the local filters excluded. This ran up beside the filtering
+        // itself, above both delete guards and the rename pass, so an exit-4 abort still
+        // committed it. Every `return 4` above now precedes it.
+        if (_db != null && filteredOut.Count > 0)
+        {
+            foreach (var entry in filteredOut)
+                _db.MarkDeleted(entry.RelativePath, sessionId, "excluded by filters; retiring tracked row");
+        }
+
+        // Moved below both delete guards and the conflict rename pass. This block used to run
+        // above them, so an exit-4 abort still committed its rows; the next run then planned
+        // fewer deletions, slipped under the same threshold, and executed them against state that
+        // was never confirmed by a completed sync.
         if (_db != null && ancestor != null)
         {
             // Paths the local filters excluded were already dropped from syncPlan above. Drop
@@ -567,6 +628,41 @@ public sealed class SyncClient
                 _progress.WriteDelete(path, backed_up: backupFirst, success: success);
                 var confirmPayload = ProtocolHandler.SerializeDeleteConfirm(path, success);
                 await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteConfirm, confirmPayload, ct);
+            }
+        }
+
+        // 10b. Record the conflicts and resurrections, now that both transfer phases have
+        // completed. Draining here rather than at plan time means a run that aborts mid-transfer
+        // records nothing, so the review report can never claim an outcome that was not actually
+        // executed. Both drains live here, together: file_versions has exactly one writer.
+        //
+        // The detail column is an ENCODED ConflictDetail, never English: the review report decodes
+        // it to print both sides' size and mtime, and Decode returns null on anything else.
+        if (_db != null)
+        {
+            foreach (var conflict in planResult.Conflicts)
+            {
+                conflictExpansion.RenamedTo.TryGetValue(conflict.Path, out var renamedTo);
+                _db.LogConflict(conflict.Path, sessionId, new ConflictDetail(
+                    conflict.ClientSize, conflict.ClientMtimeTicks,
+                    conflict.ServerSize, conflict.ServerMtimeTicks,
+                    renamedTo).Encode());
+            }
+
+            // ResurrectionInfo carries only the KEPT side. The losing side was deleted, so it has
+            // no size and no mtime to record and its two columns are written as 0 — which is
+            // unambiguous, because a surviving file always has a non-zero mtime tick count. A
+            // zero mtime column therefore reads as "this side is the one that had been deleted".
+            // RenamedTo is null: a resurrection renames nothing.
+            //
+            // The review report tells these rows apart from conflict rows by the file_versions
+            // action column, not by the detail, so a zeroed column is never read as a measured one.
+            foreach (var resurrection in planResult.Resurrections)
+            {
+                var detail = resurrection.KeptClientCopy
+                    ? new ConflictDetail(resurrection.KeptSize, resurrection.KeptMtimeTicks, 0, 0, null)
+                    : new ConflictDetail(0, 0, resurrection.KeptSize, resurrection.KeptMtimeTicks, null);
+                _db.LogResurrection(resurrection.Path, sessionId, detail.Encode());
             }
         }
 

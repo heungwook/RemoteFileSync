@@ -234,6 +234,79 @@ public sealed class SyncServer
         long bytesTransferred = 0;
         int filesDeleted = 0;
 
+        // 5a. Conflict renames. Mirror of the client's step 6b: frame-free, and completed before
+        // the first file frame so both peers' transfer sets stay aligned.
+        var conflictEntries = syncPlan.Where(p => p.Action == SyncActionType.ConflictKeepBoth).ToList();
+        if (conflictEntries.Count > 0)
+        {
+            // The server only ever sends in the TwoWay branch below, so a conflict from a Push or
+            // Pull peer would strand the renamed loser here with no phase to carry it back.
+            if (mode != SyncMode.TwoWay)
+            {
+                var msg = $"Rejecting sync plan: {conflictEntries.Count} conflict action(s) from a " +
+                          $"{mode} peer, which has no phase to receive the renamed copy.";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            // Landing a conflict name on top of an existing local file removes that file. The
+            // plan comes from a peer we do not authenticate, so a plan whose conflict names all
+            // point at real local files would be a way to empty this folder without ever sending
+            // a DeleteFile frame — bypassing both the negotiated delete flag and the budget the
+            // server enforces on DeleteOnServer. Hold squatter removal to the same two rules.
+            // Both `occupied` and `serverManifest.Count` are measured from THIS machine's own
+            // scan; nothing the peer sent is allowed to size the blast radius.
+            int occupied = ConflictKeepBothExecutor.CountOccupiedTargets(
+                syncPlan, ConflictNamer.ServerSide, _options.Folder);
+            if (occupied > 0 && !deleteEnabled)
+            {
+                var msg = $"Rejecting sync plan: {occupied} conflict name(s) would replace existing " +
+                          "local files, but the peer did not negotiate deletion.";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+            // The percentage bound is DeleteBudget.Within, not arithmetic written out again here.
+            // Squatter removal is a deletion by another name, so it must obey the byte-identical
+            // rule the DeleteOnServer guard obeys — including the two edge cases a hand-rolled
+            // `pct > max` gets wrong: a zero denominator refuses rather than disarming, and a
+            // population below MinTrackedFilesForDeleteGuard is exempt because the percentage
+            // there is noise.
+            if (!_options.ForceDelete
+                && !DeleteBudget.Within(occupied, serverManifest.Count, _options.MaxDeletePercent))
+            {
+                var msg = $"Rejecting sync plan: peer's conflict names would replace {occupied} of " +
+                          $"{serverManifest.Count} local files, exceeding this server's " +
+                          $"--max-delete-percent {_options.MaxDeletePercent}.";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            // `archive` is the session's one ArchiveManager. Constructing another here would
+            // shadow it and split this run's restore point across two session folders.
+            var conflictOutcome = ConflictKeepBothExecutor.ApplyLocalRenames(
+                syncPlan, ConflictNamer.ServerSide, _options.Folder, archive);
+
+            // See SyncClient step 6b: the plan already promised a transfer under the conflict
+            // name, so a half-applied rename hangs the peer rather than merely skipping a file.
+            if (conflictOutcome.Failures.Count > 0)
+            {
+                var msg = $"Refusing to sync: conflict rename failed for {conflictOutcome.Failures.Count} " +
+                          $"path(s): {string.Join("; ", conflictOutcome.Failures)}";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            foreach (var path in conflictOutcome.NotArchived)
+                _logger.Warning($"Conflict copy of {path} was renamed but could not be archived first.");
+
+            if (conflictOutcome.Renamed > 0)
+                _logger.Info($"Conflict: {conflictOutcome.Renamed} losing copy/copies renamed and kept.");
+        }
+
         // 6. Receive files from client (SendToServer + ClientOnly)
         var toReceive = syncPlan.Where(p =>
             p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList();
