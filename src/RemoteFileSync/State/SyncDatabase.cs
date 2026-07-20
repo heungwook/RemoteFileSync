@@ -65,7 +65,21 @@ public sealed class SyncDatabase : IDisposable
 
         _conn = new SqliteConnection($"Data Source={dbPath}");
         _conn.Open();
-        InitSchema();
+        try
+        {
+            InitSchema();
+        }
+        catch
+        {
+            // A throw here (e.g. a migration failure) would otherwise propagate out of the
+            // constructor with _conn open and unreachable via Dispose, holding the file lock
+            // for the rest of the process. Releasing it the same way Dispose does lets a user
+            // whose migration failed retry immediately instead of restarting the process.
+            _conn.Close();
+            _conn.Dispose();
+            SqliteConnection.ClearAllPools();
+            throw;
+        }
     }
 
     public static string DefaultBaseDir =>
@@ -516,12 +530,15 @@ VALUES ($path, 'deleted', NULL, NULL, $session, NULL, $detail, $ts);";
 
     public int PurgeTombstonesOlderThan(TimeSpan age)
     {
-        // A negative retention puts the cutoff in the future, which would sweep away every
-        // tombstone including ones written seconds ago — losing exactly the evidence that
-        // stops a deleted file from being resurrected on the next run.
-        if (age < TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(age),
-                "Retention age must not be negative.");
+        // age <= 0 means "no age rule", the same polarity ArchiveKeepDays and the sibling
+        // ArchiveManager.Prune use for "keep forever" (CONTRACT.md correction 3). Without this
+        // guard, TimeSpan.Zero computes cutoff = UtcNow.Ticks - 0, which deletes every
+        // tombstone whose deleted_utc is not in the future — i.e. all of them — destroying the
+        // evidence that distinguishes "re-appeared after deletion" from "never seen". A
+        // negative age would put the cutoff further in the future still, so it gets the same
+        // no-op rather than a narrower carve-out that a caller could trip on either side of.
+        if (age <= TimeSpan.Zero)
+            return 0;
 
         using var cmd = _conn.CreateCommand();
         // status is the gate, not deleted_utc alone: an 'exists' row must survive a stale
@@ -569,8 +586,13 @@ VALUES ($path, 'skipped', NULL, NULL, $session, NULL, NULL, $ts);";
     /// <summary>
     /// Legacy discovery marker, retargeted onto the v2 columns. The <paramref name="side"/>
     /// argument is accepted but not stored — v2 dropped the column. Rows land with
-    /// status='new', which every v2 decision table treats as "no usable ancestor" and routes
-    /// down the newest-wins path, never down the delete path.
+    /// status='new'. CONTRACT.md ("Why Status=="new" belongs on the additive path") REQUIRES
+    /// Phase 6's decision tables to treat 'new' exactly like a missing row: no two-sided
+    /// agreement about this file has ever happened, so it is not a usable ancestor. This class
+    /// cannot see SyncEngine's dispatch to enforce that itself, so it falls to whoever writes
+    /// it: a Phase 6 author who dispatches on `row != null && row.Status != "deleted"` would
+    /// route 'new' down the delete-capable path instead, and delete a file on the strength of
+    /// a sync that never occurred.
     /// </summary>
     public void MarkNew(string path, long fileSize, DateTime lastModified, string side)
     {

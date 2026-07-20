@@ -255,11 +255,37 @@ public sealed class SyncDatabaseSchemaV2Tests : IDisposable
     }
 
     [Fact]
-    public void PurgeTombstonesOlderThan_NegativeAge_Throws()
+    public void PurgeTombstonesOlderThan_ZeroAge_IsANoOp()
     {
+        // Zero means "no age rule" everywhere else in this project (ArchiveKeepDays,
+        // ArchiveManager.Prune per CONTRACT.md correction 3), never "cutoff is right now". A
+        // literal cutoff of UtcNow.Ticks - 0 would delete every tombstone whose deleted_utc
+        // isn't in the future -- i.e. all of them -- destroying the evidence that distinguishes
+        // "re-appeared after deletion" from "never seen".
         using var db = new SyncDatabase(_dbPath);
-        Assert.Throws<ArgumentOutOfRangeException>(
-            () => db.PurgeTombstonesOlderThan(TimeSpan.FromDays(-1)));
+        var session = db.StartSession("two-way", "/folder", "host", 8765);
+        db.UpsertSynced("old-tombstone.txt", 1, 100, 1, 100, session, "to_server");
+        db.Tombstone("old-tombstone.txt", session, "deleted long ago");
+        SetDeletedUtc("old-tombstone.txt", DateTime.UtcNow.AddYears(-5).Ticks);
+
+        Assert.Equal(0, db.PurgeTombstonesOlderThan(TimeSpan.Zero));
+        Assert.Equal("deleted", db.GetRow("old-tombstone.txt")!.Status);
+    }
+
+    [Fact]
+    public void PurgeTombstonesOlderThan_NegativeAge_IsANoOp()
+    {
+        // A negative age puts a naive cutoff even further in the future than zero does, so it
+        // gets the same no-op rather than throwing -- there is no reading of "negative
+        // retention" that should behave differently from "zero retention" here.
+        using var db = new SyncDatabase(_dbPath);
+        var session = db.StartSession("two-way", "/folder", "host", 8765);
+        db.UpsertSynced("old-tombstone.txt", 1, 100, 1, 100, session, "to_server");
+        db.Tombstone("old-tombstone.txt", session, "deleted long ago");
+        SetDeletedUtc("old-tombstone.txt", DateTime.UtcNow.AddYears(-5).Ticks);
+
+        Assert.Equal(0, db.PurgeTombstonesOlderThan(TimeSpan.FromDays(-1)));
+        Assert.Equal("deleted", db.GetRow("old-tombstone.txt")!.Status);
     }
 
     /// <summary>Writes a raw value into a tick column, bypassing the API's own range checks.</summary>

@@ -146,6 +146,15 @@ VALUES ('docs/report.docx', 'synced', 1024, $mtime, 1, 'to_server', NULL, $synce
         return Convert.ToInt64(cmd.ExecuteScalar()) > 0;
     }
 
+    private string FilesTableSql()
+    {
+        using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'files';";
+        return (string)cmd.ExecuteScalar()!;
+    }
+
     [Fact]
     public void V1Database_HasNoUserVersionStamp()
     {
@@ -159,7 +168,14 @@ VALUES ('docs/report.docx', 'synced', 1024, $mtime, 1, 'to_server', NULL, $synce
     {
         CreateV1Database();
 
-        using (var db = new SyncDatabase(_dbPath)) { }
+        using (var db = new SyncDatabase(_dbPath))
+        {
+            // ColumnsOf proves names only. A rebuild that dropped COLLATE NOCASE would still
+            // pass every column-name assertion here and only surface as a case-sensitive miss
+            // on a MIGRATED database -- the case-insensitivity tests elsewhere all run against
+            // a fresh v2 database, so this is the only place that gap would be caught.
+            Assert.NotNull(db.GetRow("DOCS/REPORT.docx"));
+        }
         SqliteConnection.ClearAllPools();
 
         Assert.Equal(2, UserVersion());
@@ -169,6 +185,13 @@ VALUES ('docs/report.docx', 'synced', 1024, $mtime, 1, 'to_server', NULL, $synce
             ColumnsOf("files"));
         // The create/copy/drop/rename scratch table must not survive the transaction.
         Assert.False(TableExists("files_v2"));
+
+        // Belt-and-braces alongside the case-insensitive lookup above: read the DDL back
+        // directly so a rebuild that silently dropped either clause is caught even if some
+        // future change to GetRow stopped exercising COLLATE NOCASE end-to-end.
+        var sql = FilesTableSql();
+        Assert.Contains("WITHOUT ROWID", sql);
+        Assert.Contains("COLLATE NOCASE", sql);
     }
 
     [Fact]
@@ -308,6 +331,39 @@ VALUES ('docs/report.docx', 'synced', 1024, $mtime, 1, 'to_server', NULL, $synce
         using var count = conn2.CreateCommand();
         count.CommandText = "SELECT COUNT(*) FROM files;";
         Assert.Equal(2L, Convert.ToInt64(count.ExecuteScalar()));
+    }
+
+    [Fact]
+    public void PragmaUserVersion_IsTransactional_RollsBackWithItsTransaction()
+    {
+        // InitSchema's whole crash-safety argument -- "the stamp commits with the table work
+        // or not at all" -- rests on PRAGMA user_version being covered by the same transaction
+        // as the surrounding DDL. It is, because user_version lives in the database header,
+        // which SQLite journals like any other page, but nothing else in this suite pins that
+        // SQLite behaviour directly rather than inferring it from InitSchema's own outcome.
+        using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using (var txn = conn.BeginTransaction())
+        {
+            using (var stamp = conn.CreateCommand())
+            {
+                stamp.Transaction = txn;
+                stamp.CommandText = "PRAGMA user_version = 2;";
+                stamp.ExecuteNonQuery();
+            }
+
+            using var readInTxn = conn.CreateCommand();
+            readInTxn.Transaction = txn;
+            readInTxn.CommandText = "PRAGMA user_version;";
+            Assert.Equal(2, Convert.ToInt32(readInTxn.ExecuteScalar()));
+
+            txn.Rollback();
+        }
+
+        using var readAfter = conn.CreateCommand();
+        readAfter.CommandText = "PRAGMA user_version;";
+        Assert.Equal(0, Convert.ToInt32(readAfter.ExecuteScalar()));
     }
 
     [Fact]
