@@ -129,6 +129,12 @@ public sealed class SyncServer
         int skippedFiles = 0;
         bool stopped = false;
 
+        // ONE clock read for the whole run. Everything stamped with this instant — the archive
+        // session folder below and the conflict-rename filenames a later phase adds — must
+        // agree, or a run longer than a second scatters its own output across two session
+        // names and neither is a complete restore point.
+        var sessionStartUtc = DateTime.UtcNow;
+
         // 1. Receive handshake
         var (hsType, hsData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         if (hsType != MessageType.Handshake)
@@ -207,7 +213,21 @@ public sealed class SyncServer
         var syncPlan = ProtocolHandler.DeserializeSyncPlan(pData);
         _logger.Info($"Sync plan: {syncPlan.Count} actions");
 
-        var backup = new BackupManager(_options.Folder, _options.EffectiveBackupFolder);
+        // Retention runs here, before the first archive write and before the first transfer,
+        // so the session folder this run is about to create can never be a prune candidate.
+        // TimeSpan.Zero — never TimeSpan.MaxValue — is the "keep forever" sentinel:
+        // DateTime.UtcNow - TimeSpan.MaxValue throws and would abort the sync at session start.
+        var keepAge = _options.ArchiveKeepDays > 0
+            ? TimeSpan.FromDays(_options.ArchiveKeepDays)
+            : TimeSpan.Zero;
+        var pruned = ArchiveManager.Prune(_options.EffectiveArchiveFolder, keepAge, _options.ArchiveMaxBytes);
+        if (pruned.SessionsRemoved > 0)
+            _logger.Info($"Archive retention: removed {pruned.SessionsRemoved} session(s), " +
+                         $"freed {pruned.BytesFreed / 1024} KB.");
+
+        // The single ArchiveManager for this session. Later phases REUSE this local; a second
+        // instance means a second session folder for the same run.
+        var archive = new ArchiveManager(_options.Folder, _options.EffectiveArchiveFolder, sessionStartUtc);
         var receiver = new FileTransferReceiver(_options.Folder);
         var sender = new FileTransferSender(_options.Folder, _options.BlockSize);
         int filesTransferred = 0;
@@ -227,7 +247,19 @@ public sealed class SyncServer
             try
             {
                 result = await receiver.ReceiveFileAsync(stream, ct,
-                    onBeforeCommit: p => action.Action == SyncActionType.SendToServer && backup.BackupFile(p));
+                    onBeforeCommit: p =>
+                    {
+                        // Not an overwrite of a file we already hold (ClientOnly push):
+                        // there is no previous version, so nothing to protect.
+                        if (action.Action != SyncActionType.SendToServer) return true;
+
+                        var outcome = archive.TryArchive(p, ArchiveReason.Overwritten, removeOriginal: false);
+                        if (outcome == ArchiveOutcome.Failed)
+                            _logger.Error($"Pre-overwrite archive failed for {p}; " +
+                                          "refusing to overwrite the local copy.");
+                        // NothingToArchive: no local file to preserve, commit is safe.
+                        return outcome != ArchiveOutcome.Failed;
+                    });
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -292,39 +324,26 @@ public sealed class SyncServer
                 bool success = false;
                 try
                 {
-                    if (backupFirst)
+                    // `backupFirst` is decoded from the wire and DELIBERATELY IGNORED. It stays
+                    // in the protocol so old peers keep parsing DeleteFile, but it no longer
+                    // selects a delete-without-archive path: our own client always sends true,
+                    // so that path was reachable only from a hostile or buggy peer, and all it
+                    // could ever do is destroy a file with no restore point. Archive() already
+                    // performs the same PathGuard containment check against _options.Folder and
+                    // returns false when it fails, so the separate guard branch that used to sit
+                    // here is redundant, not lost.
+                    if (archive.Archive(path, ArchiveReason.Deleted, removeOriginal: true))
                     {
-                        if (backup.BackupAndRemove(path))
-                        {
-                            success = true;
-                            filesDeleted++;
-                            _logger.Info($"[DEL] {path}");
-                        }
-                        else
-                        {
-                            _logger.Warning($"File not found for backup/delete: {path}. Skipping.");
-                            skippedFiles++;
-                        }
-                    }
-                    else if (!PathGuard.TryResolveWithinRoot(_options.Folder, path, out var fullPath))
-                    {
-                        _logger.Error($"Rejected delete for path outside sync root: {path}");
-                        skippedFiles++;
+                        success = true;
+                        filesDeleted++;
+                        _logger.Info($"[DEL] {path}");
                     }
                     else
                     {
-                        if (File.Exists(fullPath))
-                        {
-                            File.Delete(fullPath);
-                            success = true;
-                            filesDeleted++;
-                            _logger.Info($"[DEL] {path}");
-                        }
-                        else
-                        {
-                            _logger.Warning($"File not found for delete: {path}. Skipping.");
-                            skippedFiles++;
-                        }
+                        // Not found, outside the sync root, or unarchivable — in every case we
+                        // decline to delete rather than delete unprotected.
+                        _logger.Warning($"Could not archive {path} for deletion. Skipping.");
+                        skippedFiles++;
                     }
                 }
                 catch (Exception ex)

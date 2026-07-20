@@ -101,6 +101,13 @@ public sealed class FileTransferReceiver
     /// <paramref name="onBeforeCommit"/> receives the verified file's relative path immediately
     /// before the destination is replaced, so callers can snapshot the outgoing version. It is
     /// driven by the path actually received, not by plan order.
+    /// <para>
+    /// Its return value is a COMMIT GATE, not advisory: false means "the outgoing version is
+    /// not protected" and the destination is left untouched. A hook that had nothing to
+    /// snapshot (brand-new file) must return true. The result was previously discarded, so an
+    /// archive that failed silently — PathGuard fails closed on transient IO — still let the
+    /// overwrite destroy the only copy of the previous version.
+    /// </para>
     /// </summary>
     public async Task<FileReceiveResult> ReceiveFileAsync(Stream networkStream, CancellationToken ct,
                                                           Func<string, bool>? onBeforeCommit)
@@ -160,7 +167,19 @@ public sealed class FileTransferReceiver
                         var ticks = Math.Clamp(lastModifiedUtcTicks, 0, DateTime.MaxValue.Ticks);
                         File.SetLastWriteTimeUtc(stagingPath, new DateTime(ticks, DateTimeKind.Utc));
 
-                        onBeforeCommit?.Invoke(relativePath);
+                        // The hook is a gate. It returns false only when it was asked to
+                        // preserve an existing destination and could not; "nothing to preserve"
+                        // returns true. Committing anyway would destroy the previous version
+                        // with no restore point, which is precisely the failure this phase's
+                        // archive exists to prevent — so the destination stays as it is and the
+                        // finally block sweeps the staging file. The transfer is retried on the
+                        // next sync, when the archive root may well be reachable again.
+                        if (onBeforeCommit != null && !onBeforeCommit(relativePath))
+                        {
+                            return new FileReceiveResult(false, relativePath,
+                                "Refusing to overwrite: pre-overwrite archive failed");
+                        }
+
                         CommitWithRetry(stagingPath, destPath);
                         return new FileReceiveResult(true, relativePath);
                     }

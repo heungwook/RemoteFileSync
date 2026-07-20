@@ -1,3 +1,4 @@
+using RemoteFileSync.Backup;
 using RemoteFileSync.Network;
 using RemoteFileSync.Transfer;
 
@@ -145,5 +146,84 @@ public class FileTransferTests : IDisposable
         Assert.True(result.Success);
         Assert.True(File.Exists(Path.Combine(destDir, "sub", "deep", "nested.txt")));
         Assert.Equal("deep content", File.ReadAllText(Path.Combine(destDir, "sub", "deep", "nested.txt")));
+    }
+
+    [Fact]
+    public async Task Receive_PreCommitHookReturnsFalse_RefusesToOverwriteAndKeepsOldBytes()
+    {
+        var sourceDir = Path.Combine(_tempDir, "gate_source");
+        var destDir = Path.Combine(_tempDir, "gate_dest");
+        Directory.CreateDirectory(sourceDir);
+        Directory.CreateDirectory(destDir);
+
+        var destFile = Path.Combine(destDir, "important.txt");
+        File.WriteAllText(destFile, "PRECIOUS ORIGINAL");
+        File.WriteAllText(Path.Combine(sourceDir, "important.txt"), "replacement payload");
+
+        // A REAL ArchiveManager, made to fail the way production fails: its archive root is
+        // unreachable because a plain FILE sits where the session folder must be created, so
+        // Directory.CreateDirectory throws IOException. This is the same observable outcome as
+        // PathGuard failing closed on transient IO (PathGuard.cs:85-86) — Archive returns false
+        // and does NOT throw — but it is deterministic, whereas a reparse-point/locking race
+        // is not reproducible in CI.
+        var blocker = Path.Combine(_tempDir, "not-a-directory");
+        File.WriteAllText(blocker, "x");
+        var archive = new ArchiveManager(destDir, Path.Combine(blocker, "archive"),
+                                         new DateTime(2026, 7, 19, 14, 30, 52, DateTimeKind.Utc));
+
+        using var pipeStream = new MemoryStream();
+        var sender = new FileTransferSender(sourceDir, blockSize: 1024);
+        var receiver = new FileTransferReceiver(destDir);
+        await sender.SendFileAsync(pipeStream, fileId: 1, relativePath: "important.txt", CancellationToken.None);
+        pipeStream.Position = 0;
+
+        var result = await receiver.ReceiveFileAsync(pipeStream, CancellationToken.None,
+            onBeforeCommit: p =>
+                archive.TryArchive(p, ArchiveReason.Overwritten, removeOriginal: false)
+                    != ArchiveOutcome.Failed);
+
+        // The commit is refused, loudly. Before this task the transfer reported success and the
+        // only copy of "PRECIOUS ORIGINAL" ceased to exist.
+        Assert.False(result.Success);
+        Assert.Equal("Refusing to overwrite: pre-overwrite archive failed", result.ErrorMessage);
+        Assert.Equal("PRECIOUS ORIGINAL", File.ReadAllText(destFile));
+        Assert.Empty(Directory.GetFiles(destDir, $"*{FileTransferReceiver.StagingSuffix}*"));
+    }
+
+    [Fact]
+    public async Task Receive_ArchiveManagerRootedOutsideTheSyncFolder_HasNothingToArchiveAndStillCommits()
+    {
+        // The companion case, and the reason the gate is NOT a bare `&& archive.Archive(...)`.
+        // Rooting the manager elsewhere means the source path it guards simply does not exist,
+        // which is indistinguishable — through `bool` — from the failure above. It is the
+        // BRAND-NEW-FILE shape: there is no outgoing version to preserve, so the commit MUST
+        // proceed. Gating on `Archive(...)` alone would break every first-ever file transfer.
+        var sourceDir = Path.Combine(_tempDir, "new_source");
+        var destDir = Path.Combine(_tempDir, "new_dest");
+        var elsewhere = Path.Combine(_tempDir, "elsewhere");
+        Directory.CreateDirectory(sourceDir);
+        Directory.CreateDirectory(destDir);
+        Directory.CreateDirectory(elsewhere);
+        File.WriteAllText(Path.Combine(sourceDir, "brand-new.txt"), "first version");
+
+        var archive = new ArchiveManager(elsewhere, Path.Combine(_tempDir, "arc"),
+                                         new DateTime(2026, 7, 19, 14, 30, 52, DateTimeKind.Utc));
+
+        using var pipeStream = new MemoryStream();
+        var sender = new FileTransferSender(sourceDir, blockSize: 1024);
+        var receiver = new FileTransferReceiver(destDir);
+        await sender.SendFileAsync(pipeStream, fileId: 1, relativePath: "brand-new.txt", CancellationToken.None);
+        pipeStream.Position = 0;
+
+        Assert.Equal(ArchiveOutcome.NothingToArchive,
+            archive.TryArchive("brand-new.txt", ArchiveReason.Overwritten, removeOriginal: false));
+
+        var result = await receiver.ReceiveFileAsync(pipeStream, CancellationToken.None,
+            onBeforeCommit: p =>
+                archive.TryArchive(p, ArchiveReason.Overwritten, removeOriginal: false)
+                    != ArchiveOutcome.Failed);
+
+        Assert.True(result.Success);
+        Assert.Equal("first version", File.ReadAllText(Path.Combine(destDir, "brand-new.txt")));
     }
 }

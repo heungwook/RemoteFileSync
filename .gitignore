@@ -264,6 +264,13 @@ Generated_Code/
 # because we have git ;-)
 _UpgradeReport_Files/
 Backup*/
+# ...but these two are real source directories, not VS upgrade leftovers. Without the
+# re-inclusion, `Backup*/` silently swallows every file added under them: BackupManager.cs only
+# ever reached the repo via `git add -f`, and its replacement ArchiveManager.cs was excluded
+# from the Phase 5 commit until this was noticed. A build-breaking tree that passes locally is
+# the exact failure mode; a directory must be re-included before files inside it can be.
+!src/RemoteFileSync/Backup/
+!tests/RemoteFileSync.Tests/Backup/
 UpgradeLog*.XML
 UpgradeLog*.htm
 ServiceFabricBackup/
