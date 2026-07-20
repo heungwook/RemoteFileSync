@@ -18,13 +18,28 @@ public sealed class SyncClient
     private readonly SyncStateManager? _stateManager;
     private readonly JsonProgressWriter _progress;
     private readonly StdinCommandReader _stdinReader;
-    private readonly SyncDatabase? _db;
+    // Not readonly: when the caller supplies a path instead of an instance, RunAsync opens the
+    // database itself — and it must not do so until the no-ancestor gate has run, because
+    // `new SyncDatabase(path)` creates the file whose absence the gate is looking for.
+    // RunAsync clears this again in a finally when it was the opener, so the field never
+    // outlives the instance it points at; see the at-most-once note on RunAsync.
+    private SyncDatabase? _db;
+    private readonly string? _dbPath;
 
+    /// <param name="db">
+    /// An already-open database owned by the caller. Never disposed here.
+    /// </param>
+    /// <param name="dbPath">
+    /// Where the ancestor database lives. Supplying this instead of <paramref name="db"/> lets
+    /// RunAsync evaluate the no-ancestor gate against the on-disk state before anything opens
+    /// (and thereby creates) the file, and lets it write pair.marker on a clean exit.
+    /// </param>
     public SyncClient(SyncOptions options, SyncLogger logger,
                       SyncStateManager? stateManager = null,
                       JsonProgressWriter? progressWriter = null,
                       StdinCommandReader? stdinReader = null,
-                      SyncDatabase? db = null)
+                      SyncDatabase? db = null,
+                      string? dbPath = null)
     {
         _options = options;
         _logger = logger;
@@ -32,9 +47,105 @@ public sealed class SyncClient
         _progress = progressWriter ?? JsonProgressWriter.Null;
         _stdinReader = stdinReader ?? StdinCommandReader.Null;
         _db = db;
+        _dbPath = dbPath;
     }
 
+    /// <summary>
+    /// True when this pair has synced before but its ancestor database is gone or unusable.
+    /// An absent database on its own is indistinguishable from one deleted after a hundred
+    /// successful syncs, so pair.marker is the only thing separating a safe additive first run
+    /// from a destructive one.
+    /// </summary>
+    public static bool PairStateLost(string dbPath)
+    {
+        if (!PairMarker.Exists(dbPath)) return false;
+        if (!File.Exists(dbPath)) return true;
+
+        // A header probe, not an open. `new SyncDatabase(path)` would create the file when it is
+        // missing and run migrations when it is not, and Microsoft.Data.Sqlite pools the
+        // connection so the handle outlives the `using` — a probe that mutates, locks or removes
+        // its subject is not a probe. Sixteen bytes is enough: a truncated, empty or foreign file
+        // fails the magic and carries no ancestor rows either way.
+        try
+        {
+            using var fs = new FileStream(dbPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            Span<byte> header = stackalloc byte[SqliteFileMagic.Length];
+            int read = fs.ReadAtLeast(header, header.Length, throwOnEndOfStream: false);
+            return read < header.Length || !header.SequenceEqual(SqliteFileMagic);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Unreadable for any reason means we cannot prove the ancestor table is there. Fail
+            // closed: refusing a run is recoverable, propagating deletions computed without an
+            // ancestor table is not.
+            return true;
+        }
+    }
+
+    /// <summary>The SQLite file header, "SQLite format 3\0".</summary>
+    private static readonly byte[] SqliteFileMagic =
+        System.Text.Encoding.ASCII.GetBytes("SQLite format 3\0");
+
+    /// <summary>
+    /// Runs one sync session. <b>May be called at most once per instance.</b> When the caller
+    /// supplied <c>dbPath</c> rather than an open <c>db</c>, this method opens the ancestor
+    /// database, publishes it to <c>_db</c> for the duration of the session, and disposes it on
+    /// the way out — so a second call would find a disposed instance. Construct a new
+    /// <see cref="SyncClient"/> per session. (An instance handed in by the caller is never
+    /// disposed here and belongs to the caller.)
+    /// </summary>
     public async Task<int> RunAsync(CancellationToken ct)
+    {
+        // No-ancestor safety gate. Before the socket, before the database is opened, before any
+        // state is written — nothing at all must happen on a refusal. --mirror is the documented
+        // escape: it means "make the destination match the source", which needs no ancestor.
+        if (_dbPath != null && _options.DeleteEnabled && !_options.MirrorDeletes
+            && PairStateLost(_dbPath))
+        {
+            var msg = "Sync state lost: this pair has synced before (pair.marker is present) but " +
+                      $"its database at '{_dbPath}' is missing or unreadable. Without it, every " +
+                      "file present on only one side is indistinguishable from one the peer " +
+                      "deleted. Restore the database from backup, or re-run with --mirror to " +
+                      "accept the destination being overwritten to match the source.";
+            _logger.Error(msg);
+            _progress.WriteError(msg, fatal: true);
+            return 4;
+        }
+
+        // Only now open the ancestor database.
+        SyncDatabase? opened = null;
+        if (_db == null && _dbPath != null && _options.DeleteEnabled)
+        {
+            var binPath = Path.Combine(Path.GetDirectoryName(_dbPath)!, "sync-state.bin");
+            SyncDatabase.MigrateFromBinary(binPath, _dbPath);
+            opened = new SyncDatabase(_dbPath);
+            _db = opened;
+        }
+
+        try
+        {
+            return await RunSessionAsync(ct);
+        }
+        finally
+        {
+            // Only what this method opened is disposed — a caller-supplied instance is not ours.
+            // The field is cleared *before* the dispose so `_db` can never name a disposed
+            // object: a `using` declaration would dispose it and leave the field pointing at the
+            // corpse, and the next RunAsync call would hand HandleConnectionAsync that.
+            if (opened != null)
+            {
+                _db = null;
+                opened.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The connect-retry loop and the session itself. Split out of <see cref="RunAsync"/> only so
+    /// the database-ownership try/finally above can wrap every exit path, including the early
+    /// returns from failed connects.
+    /// </summary>
+    private async Task<int> RunSessionAsync(CancellationToken ct)
     {
         int retries = 3;
         TcpClient? tcp = null;
@@ -70,14 +181,27 @@ public sealed class SyncClient
         using var owned = tcp;
 
         _progress.WriteStatus("connecting", host: _options.Host, port: _options.Port);
-        var modeLabel = _options.Bidirectional ? "Bi-directional" : "Uni-directional";
+        var modeLabel = _options.Mode switch
+        {
+            SyncMode.Push => "Push",
+            SyncMode.Pull => "Pull",
+            _ => "Two-way",
+        };
         var deleteLabel = _options.DeleteEnabled ? " + delete" : "";
         _logger.Summary($"Connected. {modeLabel} sync{deleteLabel}." +
             (_options.Verbose ? $" Block: {_options.BlockSize / 1024}KB, Threads: {_options.MaxThreads}" : ""));
         _progress.WriteStatus("connected", mode: $"{modeLabel}{deleteLabel}");
 
         using var stream = owned.GetStream();
-        return await HandleConnectionAsync(stream, ct);
+        var exit = await HandleConnectionAsync(stream, ct);
+
+        // Arm the gate only after a clean session. A partial run leaves a database that was never
+        // finished being built, and arming on it turns the next perfectly ordinary run into a
+        // hard refusal.
+        if (exit == 0 && _dbPath != null && _options.DeleteEnabled)
+            PairMarker.Write(_dbPath);
+
+        return exit;
     }
 
     private async Task<int> HandleConnectionAsync(NetworkStream stream, CancellationToken ct)
@@ -163,8 +287,12 @@ public sealed class SyncClient
         long sessionId = 0;
         if (_options.DeleteEnabled && _db != null)
         {
-            var mode = $"{(_options.Bidirectional ? "bidi" : "uni")}+delete";
-            sessionId = _db.StartSession(mode, _options.Folder, _options.Host!, _options.Port);
+            // The session label is what the review report and the session history render, so it
+            // must name the real mode: "uni" covered Push and Pull alike, making a run that
+            // deleted local files indistinguishable from one that only uploaded.
+            var sessionMode = $"{_options.Mode.ToString().ToLowerInvariant()}+delete"
+                            + (_options.MirrorDeletes ? "+mirror" : "");
+            sessionId = _db.StartSession(sessionMode, _options.Folder, _options.Host!, _options.Port);
             _logger.Info($"Sync session started (id={sessionId})");
         }
 
@@ -291,27 +419,21 @@ public sealed class SyncClient
 
             if (!_options.ForceDelete)
             {
-                // Denominator is the tracked-file population, NOT a manifest count: with
-                // max(client, server) a peer repointed at a larger unrelated folder yields a
-                // small percentage and every tracked file gets deleted anyway.
-                int tracked = _db != null
-                    ? _db.GetAllTrackedFiles().Count(f => f.Status == "exists")
-                    : previousState?.Manifest.Count ?? 0;
+                // Bound each direction separately against the manifest of the side being deleted
+                // FROM. The old denominator was the tracked-row count, which is 0 on a wiped or
+                // never-built database — the guard then divided into nothing and skipped itself
+                // in exactly the situation state loss creates, where every peer-only file is
+                // indistinguishable from one the peer deleted.
+                //
+                // Each peer is authoritative for the deletions applied to itself: clientManifest
+                // is this client's own scan, so an inflated peer manifest cannot relax the
+                // DeleteOnClient bound. serverManifest arrived over the wire and is advisory —
+                // the server re-checks DeleteOnServer against its own scan before applying it.
+                int serverDeletes = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer);
+                int clientDeletes = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnClient);
 
-                if (tracked >= SyncOptions.MinTrackedFilesForDeleteGuard)
-                {
-                    double pct = deleteCount * 100.0 / tracked;
-                    if (pct > _options.MaxDeletePercent)
-                    {
-                        var msg = $"Refusing to sync: {deleteCount} of {tracked} tracked files " +
-                                  $"({pct:F0}%) would be deleted, exceeding --max-delete-percent " +
-                                  $"{_options.MaxDeletePercent}. Check that --folder on both sides " +
-                                  "points where you expect. If this is intentional, re-run with --force-delete.";
-                        _logger.Error(msg);
-                        _progress.WriteError(msg, fatal: true);
-                        return 4;
-                    }
-                }
+                if (!WithinDeleteBudget(serverDeletes, serverManifest.Count, "server")) return 4;
+                if (!WithinDeleteBudget(clientDeletes, clientManifest.Count, "client")) return 4;
             }
         }
 
@@ -415,9 +537,14 @@ public sealed class SyncClient
             }
         }
 
-        // 7. Send files to server (SendToServer + ClientOnly)
-        var toSend = syncPlan.Where(p =>
-            p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList();
+        // 7. Send files to server (SendToServer + ClientOnly). Pull never uploads: the server is
+        // authoritative, so a stale client copy must not be pushed back over it. Gated here as
+        // well as in the planner because the plan travels to the peer, which sizes its receive
+        // loop from it — both halves must be gated on the same predicate.
+        var toSend = ModeGate.ClientToServer(_options.Mode)
+            ? syncPlan.Where(p =>
+                p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList()
+            : new List<SyncPlanEntry>();
 
         bool desynced = false;
         foreach (var action in toSend)
@@ -496,8 +623,11 @@ public sealed class SyncClient
             return 3;   // inside the try — the finally still calls CompleteSession
         }
 
-        // 8. Deletion Phase (Server): Send DeleteFile for DeleteOnServer actions
-        if (_options.DeleteEnabled)
+        // 8. Deletion Phase (Server): Send DeleteFile for DeleteOnServer actions. Pull never
+        // deletes on the server; the server's matching receive loop is gated identically, so a
+        // plan that somehow carried DeleteOnServer in Pull mode is dropped by both peers rather
+        // than by one of them.
+        if (_options.DeleteEnabled && ModeGate.ClientToServer(_options.Mode))
         {
             var serverDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnServer).ToList();
             foreach (var del in serverDeletes)
@@ -527,8 +657,10 @@ public sealed class SyncClient
             }
         }
 
-        // 9. Receive files from server (SendToClient + ServerOnly) if bidirectional
-        if (_options.Bidirectional)
+        // 9. Receive files from server (SendToClient + ServerOnly). Push never writes to the
+        // client; the peer sends nothing in that mode, so entering this loop would block on a
+        // frame that never arrives until the session times out.
+        if (ModeGate.ServerToClient(_options.Mode))
         {
             var toReceive = syncPlan.Where(p =>
                 p.Action == SyncActionType.SendToClient || p.Action == SyncActionType.ServerOnly).ToList();
@@ -591,8 +723,11 @@ public sealed class SyncClient
             }
         }
 
-        // 10. Deletion Phase (Client): Receive DeleteFile for DeleteOnClient actions
-        if (_options.DeleteEnabled && _options.Bidirectional)
+        // 10. Deletion Phase (Client): Receive DeleteFile for DeleteOnClient actions.
+        // Gated on mode rather than Bidirectional: Pull plans DeleteOnClient too, and the old
+        // gate dropped every one of them while the server sat in its send loop waiting for a
+        // DeleteConfirm that never came.
+        if (_options.DeleteEnabled && ModeGate.ServerToClient(_options.Mode))
         {
             var clientDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnClient).ToList();
             foreach (var del in clientDeletes)
@@ -728,4 +863,23 @@ public sealed class SyncClient
         ex is EndOfStreamException
         || ex is SocketException
         || (ex is IOException { InnerException: SocketException });
+
+    /// <summary>
+    /// Percentage bound for one direction, plus the operator-facing message. The arithmetic
+    /// lives in <see cref="DeleteBudget"/> so this peer and its peer apply the same rule.
+    /// </summary>
+    private bool WithinDeleteBudget(int deletes, int destinationCount, string destinationLabel)
+    {
+        if (DeleteBudget.Within(deletes, destinationCount, _options.MaxDeletePercent)) return true;
+
+        var msg = $"Refusing to sync: {deletes} of {destinationCount} file(s) on the " +
+                  $"{destinationLabel} would be deleted, exceeding --max-delete-percent " +
+                  $"{_options.MaxDeletePercent}. Check that --folder on both sides points where " +
+                  "you expect, and that the sync database was not moved or deleted. If this is " +
+                  "intentional, re-run with --force-delete on BOTH sides — the peer enforces its " +
+                  "own copy of this bound.";
+        _logger.Error(msg);
+        _progress.WriteError(msg, fatal: true);
+        return false;
+    }
 }

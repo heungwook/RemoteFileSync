@@ -53,28 +53,18 @@ public class Program
             }
             else
             {
-                SyncDatabase? db = null;
-                if (options.DeleteEnabled)
-                {
-                    var dbPath = SyncDatabase.GetDbPath(SyncDatabase.DefaultBaseDir, options.Folder, options.Host!, options.Port);
+                // Hand over the path, not an open database. SyncClient runs the no-ancestor gate
+                // before opening it, and `new SyncDatabase(path)` creates the file — opening it
+                // here would mean the gate never sees an absent database and never fires. The
+                // binary-state migration moved with it, for the same reason.
+                string? dbPath = options.DeleteEnabled
+                    ? SyncDatabase.GetDbPath(SyncDatabase.DefaultBaseDir, options.Folder,
+                                             options.Host!, options.Port)
+                    : null;
 
-                    // Auto-migrate from old binary state if needed
-                    var binPath = Path.Combine(Path.GetDirectoryName(dbPath)!, "sync-state.bin");
-                    SyncDatabase.MigrateFromBinary(binPath, dbPath);
-
-                    db = new SyncDatabase(dbPath);
-                }
-
-                try
-                {
-                    var client = new Network.SyncClient(options, logger, db: db,
-                        progressWriter: progressWriter, stdinReader: stdinReader);
-                    return await client.RunAsync(cts.Token);
-                }
-                finally
-                {
-                    db?.Dispose();
-                }
+                var client = new Network.SyncClient(options, logger, dbPath: dbPath,
+                    progressWriter: progressWriter, stdinReader: stdinReader);
+                return await client.RunAsync(cts.Token);
             }
         }
         catch (OperationCanceledException)

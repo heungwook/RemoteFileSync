@@ -213,6 +213,26 @@ public sealed class SyncServer
         var syncPlan = ProtocolHandler.DeserializeSyncPlan(pData);
         _logger.Info($"Sync plan: {syncPlan.Count} actions");
 
+        // The plan arrives from a peer we do not authenticate, so the server enforces its own
+        // bound instead of trusting the client's. BOTH directions are bounded: in Pull mode every
+        // deletion is a DeleteOnClient the server itself originates, and the previous guard
+        // counted only DeleteOnServer, so nothing checked those at all. Checked here, before the
+        // receive loop, so a refusal happens before any file is written or removed.
+        //
+        // The two denominators are NOT equally trustworthy. serverManifest.Count is this
+        // machine's own scan and is authoritative for the deletions applied here. clientManifest
+        // .Count arrived over the wire, so a peer can inflate it to buy itself a larger
+        // DeleteOnClient budget — this bound is therefore a backstop, not the primary defence.
+        // The client enforces the same bound against its own scan before applying any of them,
+        // which is the check that cannot be relaxed by lying to us.
+        if (deleteEnabled && !_options.ForceDelete)
+        {
+            int plannedServerDeletes = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer);
+            int plannedClientDeletes = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnClient);
+            if (!WithinDeleteBudget(plannedServerDeletes, serverManifest.Count, "server")) return 4;
+            if (!WithinDeleteBudget(plannedClientDeletes, clientManifest.Count, "client")) return 4;
+        }
+
         // Retention runs here, before the first archive write and before the first transfer,
         // so the session folder this run is about to create can never be a prune candidate.
         // TimeSpan.Zero — never TimeSpan.MaxValue — is the "keep forever" sentinel:
@@ -310,9 +330,13 @@ public sealed class SyncServer
                 _logger.Info($"Conflict: {conflictOutcome.Renamed} losing copy/copies renamed and kept.");
         }
 
-        // 6. Receive files from client (SendToServer + ClientOnly)
-        var toReceive = syncPlan.Where(p =>
-            p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList();
+        // 6. Receive files from client (SendToServer + ClientOnly). Mirror of the client's send
+        // gate: the peer is unauthenticated, so the plan it sent is not trusted to be internally
+        // consistent with the mode it declared in the handshake.
+        var toReceive = ModeGate.ClientToServer(mode)
+            ? syncPlan.Where(p =>
+                p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList()
+            : new List<SyncPlanEntry>();
 
         foreach (var action in toReceive)
         {
@@ -365,27 +389,11 @@ public sealed class SyncServer
             await ProtocolHandler.WriteMessageAsync(stream, MessageType.BackupConfirm, confirm, ct);
         }
 
-        // 7. Deletion Phase (Server): Receive DeleteFile from client for DeleteOnServer actions
-        if (deleteEnabled)
+        // 7. Deletion Phase (Server): Receive DeleteFile from client for DeleteOnServer actions.
+        // The bound now lives above, before the receive loop. Gated on the same predicate as the
+        // client's matching send loop.
+        if (deleteEnabled && ModeGate.ClientToServer(mode))
         {
-            // The plan arrives over the wire from a peer we do not authenticate, so the server
-            // enforces its own bound rather than trusting the client's guard.
-            int requested = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer);
-            if (requested > 0 && serverManifest.Count >= SyncOptions.MinTrackedFilesForDeleteGuard
-                && !_options.ForceDelete)
-            {
-                double pct = requested * 100.0 / serverManifest.Count;
-                if (pct > _options.MaxDeletePercent)
-                {
-                    var msg = $"Rejecting sync plan: peer requested deletion of {requested} of " +
-                              $"{serverManifest.Count} local files ({pct:F0}%), exceeding " +
-                              $"--max-delete-percent {_options.MaxDeletePercent}.";
-                    _logger.Error(msg);
-                    _progress.WriteError(msg, fatal: true);
-                    return 4;
-                }
-            }
-
             var serverDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnServer).ToList();
             foreach (var del in serverDeletes)
             {
@@ -435,11 +443,9 @@ public sealed class SyncServer
             }
         }
 
-        // 8. Send files to client (SendToClient + ServerOnly). Two-way only at this stage; the
-        // mode-dispatch phase widens the condition to admit Pull, which also writes to the
-        // client. Behaviour is unchanged here — this is the rename forced by dropping the
-        // `bidirectional` local in favour of `mode`.
-        if (mode == SyncMode.TwoWay)
+        // 8. Send files to client (SendToClient + ServerOnly). Mirrors the client's receive gate;
+        // both sides must derive it from `mode` or the frame counts diverge.
+        if (ModeGate.ServerToClient(mode))
         {
             var toSend = syncPlan.Where(p =>
                 p.Action == SyncActionType.SendToClient || p.Action == SyncActionType.ServerOnly).ToList();
@@ -489,8 +495,9 @@ public sealed class SyncServer
             }
         }
 
-        // 9. Deletion Phase (Client): Send DeleteFile for DeleteOnClient actions
-        if (deleteEnabled && mode == SyncMode.TwoWay)
+        // 9. Deletion Phase (Client): Send DeleteFile for DeleteOnClient actions. Must use the
+        // identical predicate to the client's receive gate, or one side blocks on the other.
+        if (deleteEnabled && ModeGate.ServerToClient(mode))
         {
             var clientDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnClient).ToList();
             foreach (var del in clientDeletes)
@@ -527,5 +534,23 @@ public sealed class SyncServer
         var deletedSummary = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
         _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedSummary}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
         return exitCode;
+    }
+
+    /// <summary>
+    /// Percentage bound for one direction. <paramref name="destinationCount"/> is the file count
+    /// on the side being deleted from; for the client that is the manifest it just sent us, which
+    /// is the only view of the client's population this server has.
+    /// </summary>
+    private bool WithinDeleteBudget(int deletes, int destinationCount, string destinationLabel)
+    {
+        if (DeleteBudget.Within(deletes, destinationCount, _options.MaxDeletePercent)) return true;
+
+        var msg = $"Rejecting sync plan: it would delete {deletes} of {destinationCount} file(s) " +
+                  $"on the {destinationLabel}, exceeding this server's --max-delete-percent " +
+                  $"{_options.MaxDeletePercent}. The server enforces this independently of the " +
+                  "client; an intentional bulk deletion needs --force-delete on both sides.";
+        _logger.Error(msg);
+        _progress.WriteError(msg, fatal: true);
+        return false;
     }
 }
