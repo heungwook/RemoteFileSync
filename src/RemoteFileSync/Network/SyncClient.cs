@@ -87,12 +87,13 @@ public sealed class SyncClient
         System.Text.Encoding.ASCII.GetBytes("SQLite format 3\0");
 
     /// <summary>
-    /// Runs one sync session. <b>May be called at most once per instance.</b> When the caller
-    /// supplied <c>dbPath</c> rather than an open <c>db</c>, this method opens the ancestor
-    /// database, publishes it to <c>_db</c> for the duration of the session, and disposes it on
-    /// the way out — so a second call would find a disposed instance. Construct a new
-    /// <see cref="SyncClient"/> per session. (An instance handed in by the caller is never
-    /// disposed here and belongs to the caller.)
+    /// Runs one sync session. When the caller supplied <c>dbPath</c> rather than an open
+    /// <c>db</c>, this method opens the ancestor database, publishes it to <c>_db</c> for the
+    /// duration of the session, and clears the field again in <c>finally</c> before disposing —
+    /// so a second call on the same instance re-opens its own database and works, it does not
+    /// find a disposed one. Prefer a new <see cref="SyncClient"/> per session anyway; nothing
+    /// about reuse is exercised or supported beyond "does not crash". (An instance handed in by
+    /// the caller is never disposed here and belongs to the caller.)
     /// </summary>
     public async Task<int> RunAsync(CancellationToken ct)
     {
@@ -195,10 +196,15 @@ public sealed class SyncClient
         using var stream = owned.GetStream();
         var exit = await HandleConnectionAsync(stream, ct);
 
-        // Arm the gate only after a clean session. A partial run leaves a database that was never
-        // finished being built, and arming on it turns the next perfectly ordinary run into a
-        // hard refusal.
-        if (exit == 0 && _dbPath != null && _options.DeleteEnabled)
+        // Arm the gate once an ancestor table has actually been built, which happens on exit 0
+        // AND exit 1: the ancestor rows are written before the transfer loops and regardless of
+        // skippedFiles, so exit 1 ("completed with skipped files") leaves the same usable table
+        // behind that exit 0 does. Gating on exit == 0 alone left a pair with one
+        // permanently-locked file — which exits 1 on every run — never arming the marker, so a
+        // later-wiped database for that pair would never trip the no-ancestor gate at all: the
+        // exact loss the gate exists to catch. 2 (connection failure), 3 (protocol/fatal) and 4
+        // (safety abort) genuinely leave nothing behind and stay excluded.
+        if ((exit == 0 || exit == 1) && _dbPath != null && _options.DeleteEnabled)
             PairMarker.Write(_dbPath);
 
         return exit;
@@ -743,6 +749,27 @@ public sealed class SyncClient
 
                 var (path, backupFirst) = ProtocolHandler.DeserializeDeleteFile(delData);
                 bool success = false;
+
+                // The budget above bounds the COUNT of deletions the plan approved; it says
+                // nothing about which PATHS. `del` is the entry that count was computed from, and
+                // DeleteFile frames arrive in the same order this loop iterates `clientDeletes`,
+                // so a wire path that does not match `del.RelativePath` names a file the approved
+                // plan never listed — a hostile or buggy server could otherwise delete any N
+                // in-folder files it likes, where N is merely the approved count. PathGuard (via
+                // Archive below) only keeps the result inside the sync root; it does not check
+                // that the path was ever planned, which is the check this is.
+                if (!string.Equals(path, del.RelativePath, StringComparison.Ordinal))
+                {
+                    _logger.Error($"Protocol mismatch: expected DeleteFile for {del.RelativePath} " +
+                                  $"(next in plan order), got {path}. Refusing to delete a path " +
+                                  "the approved plan did not list.");
+                    skippedFiles++;
+                    _progress.WriteDelete(path, backed_up: backupFirst, success: false);
+                    var mismatchConfirm = ProtocolHandler.SerializeDeleteConfirm(path, success: false);
+                    await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteConfirm, mismatchConfirm, ct);
+                    continue;
+                }
+
                 try
                 {
                     // `backupFirst` is decoded from the wire and DELIBERATELY IGNORED. It stays

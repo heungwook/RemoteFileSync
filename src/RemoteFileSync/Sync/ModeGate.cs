@@ -11,8 +11,22 @@ namespace RemoteFileSync.Sync;
 public static class ModeGate
 {
     /// <summary>Client to server: file uploads and DeleteOnServer. Pull is server-authoritative.</summary>
-    public static bool ClientToServer(SyncMode mode) => mode != SyncMode.Pull;
+    // A whitelist, not `mode != SyncMode.Pull`: the old negation returned true for (SyncMode)0,
+    // which is not a defined member and reaches here from an unauthenticated peer's handshake
+    // byte. This is a shared safety predicate and must fail CLOSED on anything it does not
+    // recognise, not admit an unknown mode to the direction that writes to the server.
+    public static bool ClientToServer(SyncMode mode) => mode switch
+    {
+        SyncMode.Push => true,
+        SyncMode.TwoWay => true,
+        _ => false,
+    };
 
     /// <summary>Server to client: file downloads and DeleteOnClient. Push is client-authoritative.</summary>
-    public static bool ServerToClient(SyncMode mode) => mode != SyncMode.Push;
+    public static bool ServerToClient(SyncMode mode) => mode switch
+    {
+        SyncMode.Pull => true,
+        SyncMode.TwoWay => true,
+        _ => false,
+    };
 }

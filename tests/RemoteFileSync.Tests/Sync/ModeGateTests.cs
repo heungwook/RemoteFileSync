@@ -29,4 +29,17 @@ public class ModeGateTests
         Assert.True(ModeGate.ServerToClient(SyncMode.Pull));
         Assert.False(new SyncOptions { Mode = SyncMode.Pull }.Bidirectional);
     }
+
+    [Fact]
+    public void UndefinedMode_FailsClosedInBothDirections()
+    {
+        // `mode != SyncMode.Pull` / `mode != SyncMode.Push` both returned true for (SyncMode)0,
+        // which is not a defined member and reaches this predicate straight from an
+        // unauthenticated peer's handshake byte (the server clamps it before use today, but this
+        // is a shared safety predicate and must not rely on every caller doing that). A whitelist
+        // fails closed instead: an unrecognised mode admits neither direction.
+        var undefined = (SyncMode)0;
+        Assert.False(ModeGate.ClientToServer(undefined));
+        Assert.False(ModeGate.ServerToClient(undefined));
+    }
 }

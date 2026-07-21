@@ -44,6 +44,7 @@ public class DeleteBudgetTests
     [InlineData(5, 20, 25, true)]    // exactly at the limit — allowed
     [InlineData(6, 20, 25, false)]   // 30% — over
     [InlineData(20, 20, 100, true)]  // 100 disables the guard
+    [InlineData(1, 20, 0, false)]    // 0 is the opposite boundary — allows nothing
     public void PercentageIsBoundedByTheDestinationPopulation(
         int deletes, int destinationCount, int maxDeletePercent, bool expected)
     {

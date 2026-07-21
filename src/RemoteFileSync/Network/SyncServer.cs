@@ -227,8 +227,16 @@ public sealed class SyncServer
         // which is the check that cannot be relaxed by lying to us.
         if (deleteEnabled && !_options.ForceDelete)
         {
-            int plannedServerDeletes = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer);
-            int plannedClientDeletes = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnClient);
+            // Counted only when this mode will actually execute that direction's delete loop —
+            // gated the same way the loops themselves are below. In Push mode no DeleteOnClient
+            // frame is ever sent, so a plan carrying them (malformed or hostile) must not abort
+            // the session over a deletion the mode gate would have dropped anyway; ungated, it
+            // did, and the client then blocked on ReadMessageAsync waiting for a DeleteFile that
+            // this early return meant the server would never send.
+            int plannedServerDeletes = ModeGate.ClientToServer(mode)
+                ? syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer) : 0;
+            int plannedClientDeletes = ModeGate.ServerToClient(mode)
+                ? syncPlan.Count(p => p.Action == SyncActionType.DeleteOnClient) : 0;
             if (!WithinDeleteBudget(plannedServerDeletes, serverManifest.Count, "server")) return 4;
             if (!WithinDeleteBudget(plannedClientDeletes, clientManifest.Count, "client")) return 4;
         }
@@ -408,6 +416,26 @@ public sealed class SyncServer
 
                 var (path, backupFirst) = ProtocolHandler.DeserializeDeleteFile(delData);
                 bool success = false;
+
+                // The budget above bounds the COUNT of deletions the plan approved; it says
+                // nothing about which PATHS. `del` is the entry that count was computed from, and
+                // DeleteFile frames arrive in the same order this loop iterates `serverDeletes`,
+                // so a wire path that does not match `del.RelativePath` names a file the approved
+                // plan never listed — a hostile or buggy client could otherwise delete any N
+                // in-folder files it likes, where N is merely the approved count. PathGuard (via
+                // Archive below) only keeps the result inside the sync root; it does not check
+                // that the path was ever planned, which is the check this is.
+                if (!string.Equals(path, del.RelativePath, StringComparison.Ordinal))
+                {
+                    _logger.Warning($"Protocol mismatch: expected DeleteFile for {del.RelativePath} " +
+                                    $"(next in plan order), got {path}. Refusing to delete a path " +
+                                    "the approved plan did not list.");
+                    skippedFiles++;
+                    var mismatchConfirm = ProtocolHandler.SerializeDeleteConfirm(path, success: false);
+                    await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteConfirm, mismatchConfirm, ct);
+                    continue;
+                }
+
                 try
                 {
                     // `backupFirst` is decoded from the wire and DELIBERATELY IGNORED. It stays
