@@ -188,6 +188,52 @@ public class SyncClientGateTests : IDisposable
     }
 
     [Fact]
+    public async Task CorruptAncestorTable_WithMarker_DoesNotLeakAnOpenSessionRow()
+    {
+        // Same F1 case as above: a valid database whose `files` table is dropped, so LoadAll
+        // throws and the run aborts with exit 4 — but sync_sessions survives and is readable.
+        // The session row is opened by StartSession, which must run only AFTER the corrupt-
+        // ancestor gate has passed; otherwise the abort returns past the try/finally that owns
+        // CompleteSession and leaves a row with completed_utc = NULL forever.
+        using (var db = new SyncDatabase(_dbPath)) { }
+        using (var raw = new SqliteConnection($"Data Source={_dbPath}"))
+        {
+            raw.Open();
+            using var cmd = raw.CreateCommand();
+            cmd.CommandText = "DROP TABLE files;";
+            cmd.ExecuteNonQuery();
+        }
+        PairMarker.Write(_dbPath);
+
+        int port = ClosedPort();
+        var peerFolder = Path.Combine(_root, "peer");
+        Directory.CreateDirectory(peerFolder);
+        var serverOpts = new SyncOptions
+        {
+            IsServer = true, Once = true, BindAddress = "127.0.0.1", Port = port, Folder = peerFolder,
+        };
+        using var serverLogger = new SyncLogger(false, null, suppressConsole: true);
+        var server = new SyncServer(serverOpts, serverLogger);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var serverTask = server.RunAsync(cts.Token);
+
+        using var logger = new SyncLogger(false, null, suppressConsole: true);
+        var clientOpts = ClientOptions();
+        clientOpts.Port = port;
+        var client = new SyncClient(clientOpts, logger, dbPath: _dbPath);
+
+        Assert.Equal(4, await client.RunAsync(cts.Token));
+        try { await serverTask; } catch { /* the server may fault on the torn connection too */ }
+
+        // No StartSession row may have been left open by the aborted run.
+        using var check = new SqliteConnection($"Data Source={_dbPath}");
+        check.Open();
+        using var count = check.CreateCommand();
+        count.CommandText = "SELECT COUNT(*) FROM sync_sessions WHERE completed_utc IS NULL;";
+        Assert.Equal(0L, (long)count.ExecuteScalar()!);
+    }
+
+    [Fact]
     public void PairStateLost_FollowsTheStateTableExactly()
     {
         // A live database is kept in its own directory: PairMarker.PathFor is per-directory, so

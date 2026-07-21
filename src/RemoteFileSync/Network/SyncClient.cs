@@ -285,18 +285,11 @@ public sealed class SyncClient
                 "Fix NTP on both machines before relying on two-way sync.");
         }
 
-        // Start database session
+        // The sync_sessions row is opened inside the try below, NOT here: every abort above the
+        // try — the corrupt-ancestor LoadAll gate especially, but also a failed manifest exchange
+        // — must return before any row exists, or it leaks a row whose completed_utc stays NULL
+        // forever. sessionId is declared here so the finally can still complete it.
         long sessionId = 0;
-        if (_options.DeleteEnabled && _db != null)
-        {
-            // The session label is what the review report and the session history render, so it
-            // must name the real mode: "uni" covered Push and Pull alike, making a run that
-            // deleted local files indistinguishable from one that only uploaded.
-            var sessionMode = $"{_options.Mode.ToString().ToLowerInvariant()}+delete"
-                            + (_options.MirrorDeletes ? "+mirror" : "");
-            sessionId = _db.StartSession(sessionMode, _options.Folder, _options.Host!, _options.Port);
-            _logger.Info($"Sync session started (id={sessionId})");
-        }
 
         // 3. Scan local folder and send client manifest
         var scanner = new FileScanner(_options.Folder, _options.IncludePatterns, _options.ExcludePatterns);
@@ -419,6 +412,20 @@ public sealed class SyncClient
 
         try  // Guarantee CompleteSession in finally block
         {
+        // Open the session row as the first thing inside the try, so from here on every abort
+        // returns through the finally that completes it. The corrupt-ancestor gate and the
+        // manifest exchange already ran above and returned without opening it.
+        if (_options.DeleteEnabled && _db != null)
+        {
+            // The session label is what the review report and the session history render, so it
+            // must name the real mode: "uni" covered Push and Pull alike, making a run that
+            // deleted local files indistinguishable from one that only uploaded.
+            var sessionMode = $"{_options.Mode.ToString().ToLowerInvariant()}+delete"
+                            + (_options.MirrorDeletes ? "+mirror" : "");
+            sessionId = _db.StartSession(sessionMode, _options.Folder, _options.Host!, _options.Port);
+            _logger.Info($"Sync session started (id={sessionId})");
+        }
+
         // Deletion safety gates. Both live inside the try so an abort still completes the
         // DB session; returning from outside it would leak an open session row.
         if (_options.DeleteEnabled && deleteCount > 0)
