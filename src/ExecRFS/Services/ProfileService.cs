@@ -41,12 +41,13 @@ public partial class ProfileService
 
     /// <summary>
     /// Brings a profile loaded from disk up to date. A profile written before <see cref="SyncProfile.Mode"/>
-    /// existed has only <see cref="SyncProfile.Bidirectional"/>, so stamp an explicit Mode from it —
-    /// idempotent for newer profiles that already carry one.
+    /// existed has only <see cref="SyncProfile.Bidirectional"/>; a corrupt or hand-edited one may
+    /// carry an out-of-range integer Mode. Stamping <see cref="SyncProfile.EffectiveMode"/> (which
+    /// validates) makes the profile self-describing and idempotent for a valid Mode.
     /// </summary>
     private static SyncProfile Migrate(SyncProfile p)
     {
-        p.Mode ??= p.Bidirectional ? SyncMode.TwoWay : SyncMode.Push;
+        p.Mode = p.EffectiveMode;
         return p;
     }
 

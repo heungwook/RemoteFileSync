@@ -147,7 +147,7 @@ public class CommandBuilderTests
     }
 
     [Fact]
-    public void Build_Server_OmitsClientOnlyModeMirrorAndArchiveFlags()
+    public void Build_Server_OmitsModeAndMirror_ButEmitsArchive()
     {
         var profile = new SyncProfile
         {
@@ -155,8 +155,12 @@ public class CommandBuilderTests
             MirrorDeletes = true, ArchiveFolder = @"C:\Archive", ArchiveKeepDays = 7, ArchiveMaxBytes = 100,
         };
         var cmd = CommandBuilder.Build(profile, isServer: true);
+        // Direction and the mirror bit are derived by the server from the handshake — client-only.
         Assert.DoesNotContain("--mode", cmd);
         Assert.DoesNotContain("--mirror", cmd);
-        Assert.DoesNotContain("--archive", cmd);
+        // Archive is read from the server's OWN options: in a push the server is the archiving side.
+        Assert.Contains(@"--archive-folder ""C:\Archive""", cmd);
+        Assert.Contains("--archive-keep-days 7", cmd);
+        Assert.Contains("--archive-max-size 100", cmd);
     }
 }

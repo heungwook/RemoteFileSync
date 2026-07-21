@@ -95,6 +95,20 @@ public class ProfileServiceTests : IDisposable
     }
 
     [Fact]
+    public void Load_ProfileWithOutOfRangeMode_FallsBackToValidMode()
+    {
+        // A corrupt/hand-edited profile with an undefined integer Mode must not be trusted verbatim.
+        File.WriteAllText(Path.Combine(_tempDir, "corrupt.json"),
+            "{ \"Name\": \"Corrupt\", \"Mode\": 0, \"Bidirectional\": true }");
+
+        var loaded = _service.Load("Corrupt");
+
+        // 0 is not a defined SyncMode, so migration falls back to the Bidirectional-derived mode.
+        Assert.Equal(SyncMode.TwoWay, loaded.Mode);
+        Assert.True(System.Enum.IsDefined(loaded.Mode!.Value));
+    }
+
+    [Fact]
     public void SaveAndLoad_ModeAndArchiveFields_RoundTrip()
     {
         var profile = new SyncProfile

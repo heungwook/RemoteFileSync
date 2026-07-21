@@ -53,7 +53,8 @@ public class SyncProfile
     /// <see cref="Bidirectional"/> set. Not serialized.
     /// </summary>
     [JsonIgnore]
-    public SyncMode EffectiveMode => Mode ?? (Bidirectional ? SyncMode.TwoWay : SyncMode.Push);
+    public SyncMode EffectiveMode =>
+        Mode is { } m && Enum.IsDefined(m) ? m : (Bidirectional ? SyncMode.TwoWay : SyncMode.Push);
     public int ClientBlockSize { get; set; } = 65536;
     public int ClientMaxThreads { get; set; } = 1;
     public List<string> IncludePatterns { get; set; } = new();
