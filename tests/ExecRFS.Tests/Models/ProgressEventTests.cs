@@ -77,4 +77,40 @@ public class ProgressEventTests
         Assert.NotNull(evt);
         Assert.True(evt.Fatal);
     }
+
+    [Fact]
+    public void TryParse_ReviewConflictEvent_CarriesBothSidesAndTheRenamedCopy()
+    {
+        var evt = ProgressEvent.TryParse(
+            @"{""event"":""review"",""kind"":""conflict"",""path"":""docs/report.docx""," +
+            @"""client_size"":2100000,""client_mtime"":""2026-07-20T14:30:52.0000000Z""," +
+            @"""server_size"":2050112,""server_mtime"":""2026-07-20T14:31:10.0000000Z""," +
+            @"""renamed_to"":""docs/report.conflict-20260720-143052-server.docx""}");
+        Assert.NotNull(evt);
+        Assert.Equal("review", evt.Event);
+        Assert.Equal("conflict", evt.Kind);
+        Assert.Equal("docs/report.docx", evt.Path);
+        Assert.Equal(2100000, evt.ClientSize);
+        Assert.Equal("2026-07-20T14:30:52.0000000Z", evt.ClientMtime);
+        Assert.Equal(2050112, evt.ServerSize);
+        Assert.Equal("2026-07-20T14:31:10.0000000Z", evt.ServerMtime);
+        Assert.Equal("docs/report.conflict-20260720-143052-server.docx", evt.RenamedTo);
+    }
+
+    [Fact]
+    public void TryParse_ReviewResurrectionEvent_HasNoRenameAndKeepsUnknownSizesNegative()
+    {
+        // -1 is the CLI's "detail could not be decoded" sentinel. If it arrived as 0 the GUI
+        // would render a real file as empty; if RenamedTo defaulted to "" it would draw a blank
+        // "kept as" row for a file that was never renamed.
+        var evt = ProgressEvent.TryParse(
+            @"{""event"":""review"",""kind"":""resurrection"",""path"":""notes/todo.txt""," +
+            @"""client_size"":-1,""client_mtime"":"""",""server_size"":-1,""server_mtime"":""""}");
+        Assert.NotNull(evt);
+        Assert.Equal("resurrection", evt.Kind);
+        Assert.Equal(-1, evt.ClientSize);
+        Assert.Equal(-1, evt.ServerSize);
+        Assert.Equal("", evt.ServerMtime);
+        Assert.Null(evt.RenamedTo);
+    }
 }

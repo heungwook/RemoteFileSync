@@ -853,6 +853,16 @@ public sealed class SyncClient
         var deletedLabel = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
         _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedLabel}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
 
+        // Placed after the summary so it is the last thing on screen. A conflict, a resurrection
+        // or a first-run overwrite is a decision the sync made on the operator's behalf, and a
+        // single INF line among a thousand transfer lines is not a report — they will not see it.
+        // Conflicts and resurrections are read back from rows Phase 7's drain committed; overwrites
+        // are handed straight from planResult because the no-ancestor path that produces them can
+        // run with _db == null (a TwoWay run without --delete), so no DB row ever exists for them.
+        // archive.SessionRoot lets the report name where an overwritten local copy was archived.
+        ReviewReport.Emit(_db, sessionId, _logger, _progress,
+            planResult.Overwrites, archive.SessionRoot);
+
         // Fallback: save binary state when db is null (backward compat)
         if (_db == null && exitCode == 0 && _options.DeleteEnabled && _stateManager != null)
         {

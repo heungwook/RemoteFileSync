@@ -62,6 +62,31 @@ public sealed class JsonProgressWriter
         WriteLine(new { @event = "complete", files_transferred, files_deleted, bytes, elapsed_ms, exit_code });
     }
 
+    // One line per reviewed item, like file_end and delete, because ProgressEvent is a flat bag
+    // of nullables and cannot carry a nested array. kind is "conflict", "resurrection" or
+    // "overwrite". A size of -1 paired with an empty mtime means the stored detail could not be
+    // decoded, so the GUI must show "unknown" rather than render it as a 0-byte file.
+    // renamed_to is omitted (not null) when nothing was renamed: a null would make the GUI draw
+    // an empty "kept as" row for every resurrection and overwrite.
+    public void WriteReview(string kind, string path,
+                            long client_size, string client_mtime,
+                            long server_size, string server_mtime,
+                            string? renamed_to = null)
+    {
+        var obj = new Dictionary<string, object>
+        {
+            ["event"] = "review",
+            ["kind"] = kind,
+            ["path"] = path,
+            ["client_size"] = client_size,
+            ["client_mtime"] = client_mtime,
+            ["server_size"] = server_size,
+            ["server_mtime"] = server_mtime,
+        };
+        if (renamed_to != null) obj["renamed_to"] = renamed_to;
+        WriteLine(obj);
+    }
+
     public void WriteError(string message, bool fatal)
     {
         WriteLine(new { @event = "error", message, fatal });

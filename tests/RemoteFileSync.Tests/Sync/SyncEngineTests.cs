@@ -506,6 +506,113 @@ public class SyncEngineTests
         Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
     }
 
+    // ── No-ancestor first-run overwrite reporting ────────────────────────────
+
+    [Fact]
+    public void NoAncestor_ClientNewer_RecordsOverwriteKeepingClient()
+    {
+        // Both sides hold the file on a first run with no ancestor. Newest-wins overwrites the
+        // older server copy in place; the run must report it or the review shows "0 items" for a
+        // sync that just replaced the user's server-side edit. The action itself is unchanged.
+        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+
+        Assert.Equal(SyncActionType.SendToServer, Assert.Single(result.Entries).Action);
+
+        var ow = Assert.Single(result.Overwrites);
+        Assert.Equal("f.txt", ow.Path);
+        Assert.True(ow.KeptClientCopy);
+        Assert.Equal(150, ow.KeptSize);
+        Assert.Equal(T2.Ticks, ow.KeptMtimeTicks);
+        Assert.Equal(100, ow.ReplacedSize);
+        Assert.Equal(T1.Ticks, ow.ReplacedMtimeTicks);
+    }
+
+    [Fact]
+    public void NoAncestor_ServerLarger_RecordsOverwriteKeepingServer()
+    {
+        // Same mtime, server copy larger, so the size tie-break sends to the client and the
+        // client's copy is the one overwritten. KeptClientCopy must flip so the report names the
+        // right survivor and the right casualty.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 200, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+
+        Assert.Equal(SyncActionType.SendToClient, Assert.Single(result.Entries).Action);
+
+        var ow = Assert.Single(result.Overwrites);
+        Assert.Equal("f.txt", ow.Path);
+        Assert.False(ow.KeptClientCopy);
+        Assert.Equal(200, ow.KeptSize);
+        Assert.Equal(T1.Ticks, ow.KeptMtimeTicks);
+        Assert.Equal(100, ow.ReplacedSize);
+        Assert.Equal(T1.Ticks, ow.ReplacedMtimeTicks);
+    }
+
+    [Fact]
+    public void NoAncestor_SameContent_RecordsNoOverwrite()
+    {
+        // Identical size and mtime resolves to Skip: nothing is replaced, so nothing is reported.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+        Assert.Equal(SyncActionType.Skip, Assert.Single(result.Entries).Action);
+        Assert.Empty(result.Overwrites);
+    }
+
+    [Fact]
+    public void NoAncestor_OneSided_RecordsNoOverwrite()
+    {
+        // A file present on only one side is a pure add — there is no loser to overwrite, so the
+        // additive branch must never fabricate an overwrite record.
+        var client = MakeManifest(new FileEntry("c-only.txt", 50, T1));
+        var server = MakeManifest(new FileEntry("s-only.txt", 50, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+        Assert.Empty(result.Overwrites);
+    }
+
+    [Fact]
+    public void NoAncestor_SkewNormalisesBeforeDecidingOverwrite()
+    {
+        // The server clock is +1h; after normalisation the two copies match and resolve to Skip.
+        // Recording an overwrite off the raw mtimes would report a replacement that never happened.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T2.AddHours(1)));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null,
+                          skew: new ClockSkew(TimeSpan.FromHours(1)));
+        Assert.Equal(SyncActionType.Skip, Assert.Single(result.Entries).Action);
+        Assert.Empty(result.Overwrites);
+    }
+
+    [Fact]
+    public void TwoWayConflict_RecordsNoOverwrite()
+    {
+        // A both-sides-changed conflict keeps both copies; it is not an overwrite. Overwrites are
+        // strictly a no-ancestor, one-copy-wins phenomenon, so the ancestor conflict path must
+        // leave Overwrites empty and route the row through Conflicts instead.
+        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2.AddMinutes(5)));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Equal(SyncActionType.ConflictKeepBoth, Assert.Single(result.Entries).Action);
+        Assert.Single(result.Conflicts);
+        Assert.Empty(result.Overwrites);
+    }
+
+    [Fact]
+    public void Push_DifferingCopies_RecordsNoOverwrite()
+    {
+        // Push and Pull are authoritative: the user chose one side to win, so the loser being
+        // overwritten is the documented contract, not a surprise worth a review line. Only the
+        // no-ancestor TwoWay path reports overwrites, so Push must leave the list empty even
+        // though it overwrites the server copy.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var result = Plan(client, server, SyncMode.Push, ancestor: null);
+        Assert.Equal(SyncActionType.SendToServer, Assert.Single(result.Entries).Action);
+        Assert.Empty(result.Overwrites);
+    }
+
     // ── BuildMergedManifest ──────────────────────────────────────────────────
 
     [Fact]

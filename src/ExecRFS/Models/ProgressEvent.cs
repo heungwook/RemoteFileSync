@@ -33,6 +33,18 @@ public class ProgressEvent
     [JsonPropertyName("fatal")] public bool? Fatal { get; set; }
     [JsonPropertyName("error")] public string? Error { get; set; }
 
+    // "review" event: one per conflict, resurrection or overwrite, emitted after "complete".
+    // Kind is "conflict", "resurrection" or "overwrite"; the path reuses the existing Path
+    // property above. A size of -1 with an empty mtime means the CLI could not decode the stored
+    // ConflictDetail, so the GUI must show "unknown" rather than treat it as a 0-byte file.
+    // RenamedTo is absent from the JSON when nothing was renamed, so it stays null here.
+    [JsonPropertyName("kind")] public string? Kind { get; set; }
+    [JsonPropertyName("client_size")] public long? ClientSize { get; set; }
+    [JsonPropertyName("client_mtime")] public string? ClientMtime { get; set; }
+    [JsonPropertyName("server_size")] public long? ServerSize { get; set; }
+    [JsonPropertyName("server_mtime")] public string? ServerMtime { get; set; }
+    [JsonPropertyName("renamed_to")] public string? RenamedTo { get; set; }
+
     public static ProgressEvent? TryParse(string line)
     {
         try { return JsonSerializer.Deserialize<ProgressEvent>(line); }

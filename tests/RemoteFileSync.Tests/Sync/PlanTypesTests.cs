@@ -92,6 +92,32 @@ public class PlanTypesTests
     }
 
     [Fact]
+    public void PlanResult_OverwritesDefaultsToEmptyNonNullList()
+    {
+        // Overwrites is the third side channel the caller drains after the transfer phase. Like
+        // Conflicts and Resurrections it must never be null, or a first run that overwrote a
+        // loser — the case this list exists to report — would NullReference on the drain.
+        var result = new PlanResult();
+        Assert.NotNull(result.Overwrites);
+        Assert.Empty(result.Overwrites);
+    }
+
+    [Fact]
+    public void OverwriteInfo_UsesValueEquality()
+    {
+        // Same reason as ConflictInfo: the report and E2E suites match on constructed values, so
+        // reference equality would fail every assertion for the wrong reason. KeptClientCopy is
+        // the side discriminator the report renders, so it must participate in equality.
+        var a = new OverwriteInfo("f.txt", KeptClientCopy: true,
+            KeptSize: 150, KeptMtimeTicks: 22, ReplacedSize: 100, ReplacedMtimeTicks: 11);
+        var b = new OverwriteInfo("f.txt", KeptClientCopy: true,
+            KeptSize: 150, KeptMtimeTicks: 22, ReplacedSize: 100, ReplacedMtimeTicks: 11);
+        Assert.Equal(a, b);
+        Assert.NotEqual(a, a with { KeptClientCopy = false });
+        Assert.NotEqual(a, a with { ReplacedSize = 99 });
+    }
+
+    [Fact]
     public void ConflictInfo_UsesValueEquality()
     {
         // The end-of-sync report and the E2E suites locate entries with Assert.Contains against a

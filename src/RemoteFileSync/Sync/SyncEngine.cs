@@ -53,7 +53,7 @@ public static class SyncEngine
                 SyncMode.Pull => PlanPull(client, server, row, deleteEnabled, mirrorDeletes, skew),
                 SyncMode.TwoWay => IsAncestor(row)
                     ? PlanTwoWayWithAncestor(path, client, server, row!, deleteEnabled, result)
-                    : PlanNoAncestor(client, server, skew),
+                    : PlanNoAncestor(path, client, server, skew, result),
                 _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown sync mode."),
             };
 
@@ -137,10 +137,32 @@ public static class SyncEngine
     /// No usable row: we cannot tell an edit from a deletion, so this path is strictly additive
     /// and must never return DeleteOnServer or DeleteOnClient. Only TwoWay reaches it — Push and
     /// Pull have their own tables and handle the missing-row case themselves.
+    /// When both sides hold a differing copy, newest-wins overwrites the loser: the ACTION is
+    /// unchanged from before, but an <see cref="OverwriteInfo"/> is recorded on
+    /// <paramref name="result"/> so the review report can tell the user which copy was replaced.
+    /// A Skip (identical or skew-equal copies) replaces nothing and records nothing, and a
+    /// one-sided file is a pure add with no loser — so only SendToServer / SendToClient on the
+    /// both-present branch produce an overwrite.
     /// </summary>
-    private static SyncActionType? PlanNoAncestor(FileEntry? client, FileEntry? server, ClockSkew skew)
+    private static SyncActionType? PlanNoAncestor(
+        string path, FileEntry? client, FileEntry? server, ClockSkew skew, PlanResult result)
     {
-        if (client != null && server != null) return ResolveNoAncestor(client, server, skew);
+        if (client != null && server != null)
+        {
+            var action = ResolveNoAncestor(client, server, skew);
+
+            if (action == SyncActionType.SendToServer)
+                result.Overwrites.Add(new OverwriteInfo(path, KeptClientCopy: true,
+                    KeptSize: client.FileSize, KeptMtimeTicks: client.LastModifiedUtc.Ticks,
+                    ReplacedSize: server.FileSize, ReplacedMtimeTicks: server.LastModifiedUtc.Ticks));
+            else if (action == SyncActionType.SendToClient)
+                result.Overwrites.Add(new OverwriteInfo(path, KeptClientCopy: false,
+                    KeptSize: server.FileSize, KeptMtimeTicks: server.LastModifiedUtc.Ticks,
+                    ReplacedSize: client.FileSize, ReplacedMtimeTicks: client.LastModifiedUtc.Ticks));
+
+            return action;
+        }
+
         if (client != null) return SyncActionType.SendToServer;
         if (server != null) return SyncActionType.SendToClient;
         return null;

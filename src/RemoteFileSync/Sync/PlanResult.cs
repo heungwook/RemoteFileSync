@@ -26,6 +26,14 @@ public sealed class PlanResult
     /// <see cref="Resurrections"/>.
     /// </summary>
     public List<ConflictInfo> Conflicts { get; init; } = new();
+
+    /// <summary>
+    /// First-run overwrites: on the no-ancestor path a file both sides held with differing
+    /// content resolves newest-wins and the loser is overwritten in place. The loser is archived
+    /// so it is recoverable, but the run must report it — otherwise the review shows nothing for a
+    /// sync that just replaced a user's edit. Same non-null contract as the other two lists.
+    /// </summary>
+    public List<OverwriteInfo> Overwrites { get; init; } = new();
 }
 
 /// <summary>
@@ -44,3 +52,18 @@ public sealed record ResurrectionInfo(string Path, bool KeptClientCopy, long Kep
 /// can show the user what the two copies were without re-scanning either tree.
 /// </summary>
 public sealed record ConflictInfo(string Path, long ClientSize, long ClientMtimeTicks, long ServerSize, long ServerMtimeTicks);
+
+/// <summary>
+/// A first-run overwrite: both sides held the file with differing content, no ancestor said which
+/// changed, so newest-wins kept one copy and overwrote the other. Carries both copies' size and
+/// mtime plus which side survived, so the report can show what was replaced and what was kept
+/// without re-scanning either tree.
+/// </summary>
+/// <param name="KeptClientCopy">
+/// True when the client's copy won and the server's was overwritten; false for the mirror. The
+/// report renders the surviving and replaced sides from this, so it cannot be inferred later.
+/// </param>
+public sealed record OverwriteInfo(
+    string Path, bool KeptClientCopy,
+    long KeptSize, long KeptMtimeTicks,
+    long ReplacedSize, long ReplacedMtimeTicks);
