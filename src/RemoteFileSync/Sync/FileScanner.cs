@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using RemoteFileSync.Models;
 using RemoteFileSync.Transfer;
 
@@ -18,6 +19,16 @@ public sealed class FileScanner
 
     /// <summary>Age after which an abandoned staging file is swept during a scan.</summary>
     private static readonly TimeSpan StagingFileMaxAge = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// The exact shape a staging file's name ends with: the suffix followed by the 32 lowercase
+    /// hex characters of a <c>Guid.NewGuid():N</c>, anchored at end-of-name. The sweep validates
+    /// candidates against this before deleting so a user file that merely contains the suffix
+    /// (e.g. "notes.rfs-part-draft.txt") is never destroyed.
+    /// </summary>
+    private static readonly Regex StagingFileNamePattern = new(
+        Regex.Escape(FileTransferReceiver.StagingSuffix) + "[0-9a-f]{32}$",
+        RegexOptions.CultureInvariant);
 
     /// <summary>
     /// Number of directories skipped during the last scan because they could not be read.
@@ -100,6 +111,10 @@ public sealed class FileScanner
             foreach (var stale in Directory.EnumerateFiles(
                          _rootPath, $"*{FileTransferReceiver.StagingSuffix}*", SearchOption.AllDirectories))
             {
+                // The glob is only a cheap prefilter — its trailing '*' matches anything after the
+                // suffix. Confirm the exact "<name>.rfs-part-<32 hex>" shape before deleting, so a
+                // real user file that merely contains ".rfs-part-" is never destroyed unrecoverably.
+                if (!StagingFileNamePattern.IsMatch(Path.GetFileName(stale))) continue;
                 try
                 {
                     if (File.GetLastWriteTimeUtc(stale) < cutoff) File.Delete(stale);
