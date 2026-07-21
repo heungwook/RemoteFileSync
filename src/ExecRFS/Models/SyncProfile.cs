@@ -9,8 +9,10 @@ public class SyncProfile
     public int ServerPort { get; set; } = 15782;
 
     /// <summary>
-    /// Address the server binds to. Loopback by default — the protocol is unauthenticated,
-    /// so exposing it grants any reachable peer read/write/delete in the sync folder.
+    /// Address the server binds to. Loopback (127.0.0.1) by default — the protocol is
+    /// UNAUTHENTICATED, so binding to 0.0.0.0 (all interfaces) exposes read/write/delete in the
+    /// sync folder to any peer that can reach the port. Cross-machine sync is an explicit opt-in:
+    /// set 0.0.0.0 in the Server panel's Bind Address field, on a trusted network/VPN only.
     /// </summary>
     public string ServerBindAddress { get; set; } = "127.0.0.1";
     public string? ServerBackupFolder { get; set; }

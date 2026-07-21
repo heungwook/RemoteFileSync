@@ -23,6 +23,18 @@
                @onchange="e => Profile.ServerPort = int.TryParse(e.Value?.ToString(), out var p) ? p : 15782" />
     </div>
 
+    @* Bind Address *@
+    <div class="field">
+        <div class="field-label">Bind Address</div>
+        <input type="text" placeholder="127.0.0.1"
+               value="@Profile.ServerBindAddress"
+               @onchange="e => Profile.ServerBindAddress = e.Value?.ToString()?.Trim() ?? string.Empty" />
+        <div style="font-size:10px; color:var(--muted); margin-top:2px;">
+            127.0.0.1 (default/blank) = this machine only; 0.0.0.0 = all interfaces (reachable from
+            other machines). The protocol is unauthenticated — use 0.0.0.0 only on a trusted network or VPN.
+        </div>
+    </div>
+
     @* Backup Folder *@
     <FolderPicker Label="Backup Folder (optional)"
                   Value="@Profile.ServerBackupFolder"

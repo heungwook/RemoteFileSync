@@ -24,6 +24,16 @@ public class CommandBuilderTests
     }
 
     [Fact]
+    public void Build_ServerMode_DefaultBindIsLoopback()
+    {
+        // Safe default: a GUI-launched server binds to loopback. Cross-machine reachability is an
+        // explicit opt-in via the Server panel's Bind Address field (0.0.0.0).
+        var profile = new SyncProfile { ServerFolder = @"D:\Sync" };
+        var cmd = CommandBuilder.Build(profile, isServer: true);
+        Assert.Contains(@"--bind ""127.0.0.1""", cmd);
+    }
+
+    [Fact]
     public void Build_ServerMode_GeneratesCorrectArgs()
     {
         var profile = new SyncProfile { ServerFolder = @"D:\Sync", ServerPort = 15782 };
