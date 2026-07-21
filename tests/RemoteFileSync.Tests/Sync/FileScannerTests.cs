@@ -154,7 +154,8 @@ public class FileScannerTests : IDisposable
     [Fact]
     public void Scan_SweepsStaleStagingFiles()
     {
-        var stale = Path.Combine(_testDir, $"old.txt{FileTransferReceiver.StagingSuffix}deadbeef");
+        // A genuine staging file: FileTransfer names these "<dest>.rfs-part-<Guid:N>", 32 hex.
+        var stale = Path.Combine(_testDir, $"old.txt{FileTransferReceiver.StagingSuffix}{Guid.NewGuid():N}");
         Directory.CreateDirectory(Path.GetDirectoryName(stale)!);
         File.WriteAllText(stale, "abandoned");
         File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddDays(-2));
@@ -162,6 +163,47 @@ public class FileScannerTests : IDisposable
         new FileScanner(_testDir, new(), new()).Scan();
 
         Assert.False(File.Exists(stale));
+    }
+
+    [Fact]
+    public void Scan_DoesNotSweepFreshStagingFile()
+    {
+        // The age gate still protects an in-progress receive from being swept mid-transfer.
+        var fresh = Path.Combine(_testDir, $"live.txt{FileTransferReceiver.StagingSuffix}{Guid.NewGuid():N}");
+        File.WriteAllText(fresh, "in progress");
+
+        new FileScanner(_testDir, new(), new()).Scan();
+
+        Assert.True(File.Exists(fresh));
+    }
+
+    [Fact]
+    public void Scan_DoesNotSweepUserFileMerelyContainingStagingSubstring()
+    {
+        // A real user file whose name happens to contain ".rfs-part-" is NOT a staging file:
+        // the loose "*.rfs-part-*" glob would destroy it unrecoverably. The real staging shape
+        // is "<name>.rfs-part-<32 hex>" at end-of-name, which this decoy does not have.
+        var decoy = Path.Combine(_testDir, $"notes{FileTransferReceiver.StagingSuffix}draft.txt");
+        File.WriteAllText(decoy, "irreplaceable user data");
+        File.SetLastWriteTimeUtc(decoy, DateTime.UtcNow.AddDays(-2));
+
+        new FileScanner(_testDir, new(), new()).Scan();
+
+        Assert.True(File.Exists(decoy));
+    }
+
+    [Fact]
+    public void Scan_DoesNotSweepStagingNameWithNon32HexTail()
+    {
+        // Same suffix, but the tail is not a 32-hex GUID (8 chars here), so it cannot be a file
+        // FileTransfer created (Guid.NewGuid():N is always exactly 32 lowercase hex chars).
+        var decoy = Path.Combine(_testDir, $"x.txt{FileTransferReceiver.StagingSuffix}deadbeef");
+        File.WriteAllText(decoy, "irreplaceable user data");
+        File.SetLastWriteTimeUtc(decoy, DateTime.UtcNow.AddDays(-2));
+
+        new FileScanner(_testDir, new(), new()).Scan();
+
+        Assert.True(File.Exists(decoy));
     }
 
     [Fact]

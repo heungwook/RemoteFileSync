@@ -4,7 +4,6 @@ using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
 using RemoteFileSync.Progress;
-using RemoteFileSync.Security;
 using RemoteFileSync.State;
 using RemoteFileSync.Sync;
 using RemoteFileSync.Transfer;
@@ -15,7 +14,6 @@ public sealed class SyncClient
 {
     private readonly SyncOptions _options;
     private readonly SyncLogger _logger;
-    private readonly SyncStateManager? _stateManager;
     private readonly JsonProgressWriter _progress;
     private readonly StdinCommandReader _stdinReader;
     // Not readonly: when the caller supplies a path instead of an instance, RunAsync opens the
@@ -35,7 +33,6 @@ public sealed class SyncClient
     /// (and thereby creates) the file, and lets it write pair.marker on a clean exit.
     /// </param>
     public SyncClient(SyncOptions options, SyncLogger logger,
-                      SyncStateManager? stateManager = null,
                       JsonProgressWriter? progressWriter = null,
                       StdinCommandReader? stdinReader = null,
                       SyncDatabase? db = null,
@@ -43,7 +40,6 @@ public sealed class SyncClient
     {
         _options = options;
         _logger = logger;
-        _stateManager = stateManager;
         _progress = progressWriter ?? JsonProgressWriter.Null;
         _stdinReader = stdinReader ?? StdinCommandReader.Null;
         _db = db;
@@ -289,31 +285,13 @@ public sealed class SyncClient
                 "Fix NTP on both machines before relying on two-way sync.");
         }
 
-        // Start database session
+        // The sync_sessions row is opened inside the try below, NOT here: every abort above the
+        // try — the corrupt-ancestor LoadAll gate especially, but also a failed manifest exchange
+        // — must return before any row exists, or it leaks a row whose completed_utc stays NULL
+        // forever. sessionId is declared here so the finally can still complete it.
         long sessionId = 0;
-        if (_options.DeleteEnabled && _db != null)
-        {
-            // The session label is what the review report and the session history render, so it
-            // must name the real mode: "uni" covered Push and Pull alike, making a run that
-            // deleted local files indistinguishable from one that only uploaded.
-            var sessionMode = $"{_options.Mode.ToString().ToLowerInvariant()}+delete"
-                            + (_options.MirrorDeletes ? "+mirror" : "");
-            sessionId = _db.StartSession(sessionMode, _options.Folder, _options.Host!, _options.Port);
-            _logger.Info($"Sync session started (id={sessionId})");
-        }
 
-        // 3. Load previous state (if delete enabled)
-        SyncState? previousState = null;
-        if (_options.DeleteEnabled && _stateManager != null)
-        {
-            previousState = _stateManager.LoadState(_options.Folder, _options.Host!, _options.Port);
-            if (previousState == null)
-                _logger.Info("No previous sync state found. First run with --delete: fully additive.");
-            else
-                _logger.Info($"Loaded sync state: {previousState.Manifest.Count} files from {previousState.LastSyncUtc:u}");
-        }
-
-        // 4. Scan local folder and send client manifest
+        // 3. Scan local folder and send client manifest
         var scanner = new FileScanner(_options.Folder, _options.IncludePatterns, _options.ExcludePatterns);
         var clientManifest = scanner.Scan();
         _logger.Info($"Local manifest: {clientManifest.Count} files");
@@ -321,13 +299,13 @@ public sealed class SyncClient
         var clientManifestBytes = ProtocolHandler.SerializeManifest(clientManifest);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.Manifest, clientManifestBytes, ct);
 
-        // 5. Receive server manifest
+        // 4. Receive server manifest
         var (mType, mData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         var serverManifest = ProtocolHandler.DeserializeManifest(mData);
         _logger.Info($"Remote manifest: {serverManifest.Count} files");
         _progress.WriteManifest("remote", serverManifest.Count, serverManifest.Entries.Sum(e => e.FileSize));
 
-        // 6. Compute sync plan and send
+        // 5. Compute sync plan and send
         // A null ancestor table is the honest signal for "we do not know what changed", and the
         // engine refuses to emit any deletion on that path.
         // `skew` is the measured client-vs-server clock offset from the v3 handshake above.
@@ -434,6 +412,20 @@ public sealed class SyncClient
 
         try  // Guarantee CompleteSession in finally block
         {
+        // Open the session row as the first thing inside the try, so from here on every abort
+        // returns through the finally that completes it. The corrupt-ancestor gate and the
+        // manifest exchange already ran above and returned without opening it.
+        if (_options.DeleteEnabled && _db != null)
+        {
+            // The session label is what the review report and the session history render, so it
+            // must name the real mode: "uni" covered Push and Pull alike, making a run that
+            // deleted local files indistinguishable from one that only uploaded.
+            var sessionMode = $"{_options.Mode.ToString().ToLowerInvariant()}+delete"
+                            + (_options.MirrorDeletes ? "+mirror" : "");
+            sessionId = _db.StartSession(sessionMode, _options.Folder, _options.Host!, _options.Port);
+            _logger.Info($"Sync session started (id={sessionId})");
+        }
+
         // Deletion safety gates. Both live inside the try so an abort still completes the
         // DB session; returning from outside it would leak an open session row.
         if (_options.DeleteEnabled && deleteCount > 0)
@@ -639,11 +631,22 @@ public sealed class SyncClient
                 desynced = true;
                 break;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}");
-                skippedFiles++;
+                // A non-disconnect, non-cancellation failure mid-send — a locked or removed source
+                // file, a compression or disk error — is terminal for the phase, NOT a per-file
+                // skip. SendFileAsync may already have put a FileStart (and some chunks) on the
+                // wire before throwing, and the receiver sizes its loop positionally from the
+                // shared plan: continuing would leave it waiting for a file that never finishes and
+                // attribute every later file's frames and confirm to the wrong entry. Abort like
+                // the desync/disconnect paths above. Cancellation is deliberately excluded (as the
+                // receive loop below does) so Ctrl+C / stop / timeout propagate to Program's
+                // cancellation handler instead of being reported as a fatal protocol desync.
+                _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}. Aborting the " +
+                              "transfer phase to avoid a desynchronised stream.");
                 _progress.WriteFileEnd(action.RelativePath, success: false, error: ex.Message);
+                desynced = true;
+                break;
             }
         }
 
@@ -930,14 +933,6 @@ public sealed class SyncClient
         ReviewReport.Emit(_db, sessionId, _logger, _progress,
             planResult.Overwrites, archive.SessionRoot);
 
-        // Fallback: save binary state when db is null (backward compat)
-        if (_db == null && exitCode == 0 && _options.DeleteEnabled && _stateManager != null)
-        {
-            var mergedManifest = SyncEngine.BuildMergedManifest(clientManifest, serverManifest, syncPlan);
-            _stateManager.SaveState(_options.Folder, _options.Host!, _options.Port, mergedManifest, DateTime.UtcNow);
-            _logger.Debug($"Sync state saved: {mergedManifest.Count} files");
-        }
-
         return exitCode;
         }
         finally
@@ -954,14 +949,16 @@ public sealed class SyncClient
     }
 
     /// <summary>
-    /// True when <paramref name="ex"/> means the socket itself is gone, as opposed to a
-    /// per-file failure (missing local file, checksum mismatch, sharing violation) that leaves
-    /// the connection usable for the next file in the loop. EndOfStreamException is the one
-    /// ProtocolHandler.ReadExactAsync raises itself, always for "the peer closed its end"; a
-    /// SocketException carried as IOException.InnerException is NetworkStream's wrapping of the
-    /// same condition on a write. A bare IOException is deliberately excluded — that is also
-    /// what a locked or unreadable source file throws, and misclassifying it here would abort
-    /// the whole transfer phase over one file instead of skipping just that file.
+    /// True when <paramref name="ex"/> means the socket itself is gone, as opposed to a local
+    /// per-file failure (missing local file, checksum mismatch, sharing violation).
+    /// EndOfStreamException is the one ProtocolHandler.ReadExactAsync raises itself, always for
+    /// "the peer closed its end"; a SocketException carried as IOException.InnerException is
+    /// NetworkStream's wrapping of the same condition on a write. A bare IOException is
+    /// deliberately excluded — that is also what a locked or unreadable source file throws.
+    /// Both cases are now terminal for the transfer phase (a silently skipped file would desync
+    /// the positional frame stream), so this predicate no longer decides skip-vs-abort; it only
+    /// picks the diagnostic message — a real disconnect reports that the peer likely rejected the
+    /// plan, a local failure names the file that could not be read.
     /// </summary>
     private static bool IsPeerDisconnect(Exception ex) =>
         ex is EndOfStreamException

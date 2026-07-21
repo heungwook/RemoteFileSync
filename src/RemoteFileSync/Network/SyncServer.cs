@@ -507,10 +507,19 @@ public sealed class SyncServer
                     _logger.Info($"[→] {action.RelativePath}");
                     filesTransferred++;
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}");
-                    skippedFiles++;
+                    // Terminal, not a per-file skip — same reasoning as the client's send loop: the
+                    // receiver sizes its loop positionally from the shared plan, so a file skipped
+                    // after SendFileAsync has already put frames on the wire desynchronises every
+                    // later file and confirm. A locked/removed source or a disk error aborts the
+                    // phase. (A peer disconnect lands here too and is likewise terminal.) Cancellation
+                    // is excluded, mirroring the Phase 6 guard, so a graceful stop or the session
+                    // timeout is routed by the accept loop rather than reported as a protocol desync.
+                    _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}. Aborting the " +
+                                  "transfer phase to avoid a desynchronised stream.");
+                    desynced = true;
+                    break;
                 }
             }
 
