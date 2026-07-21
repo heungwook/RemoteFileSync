@@ -19,7 +19,7 @@
     <div class="progress-bar-track">
         <div class="progress-bar-fill" style="width:@(_percent)%"></div>
     </div>
-    @if (_conflicts + _resurrections + _overwrites > 0)
+    @if (_conflicts + _resurrections + _overwrites + _otherReviews > 0)
     {
         <div style="font-size:10px; color:var(--muted); margin-top:4px;">Review: @ReviewSummary()</div>
     }
@@ -39,10 +39,12 @@
     private int _percent;
 
     // Review events (conflict / resurrection / overwrite) arrive after "complete"; counted here
-    // as an aggregate. Reset when a new run starts, NOT on "complete".
+    // as an aggregate. Reset when a new run starts, NOT on "complete". _otherReviews catches any
+    // future/unknown kind so this summary never silently under-counts the detailed list.
     private int _conflicts;
     private int _resurrections;
     private int _overwrites;
+    private int _otherReviews;
 
     private System.Timers.Timer? _timer;
 
@@ -70,6 +72,13 @@
 
     private void HandleStateChange(SyncInstanceState state)
     {
+        if (state == SyncInstanceState.Starting)
+        {
+            // Reset the review tally the moment a run is initiated, so a start that fails before
+            // reaching Running (Starting -> Error) leaves no stale "Review:" summary. Matches
+            // ClientPanel's Starting-based reset so the two surfaces stay in step.
+            _conflicts = _resurrections = _overwrites = _otherReviews = 0;
+        }
         if (state == SyncInstanceState.Running && _startTime == null)
         {
             _startTime = DateTime.Now;
@@ -79,7 +88,6 @@
             _bytesForCurrentFile = 0;
             _totalBytes = 0;
             _threadCurrentBytes.Clear();
-            _conflicts = _resurrections = _overwrites = 0;
         }
         else if (state == SyncInstanceState.Stopped || state == SyncInstanceState.Error)
         {
@@ -135,6 +143,7 @@
                     case "conflict":     _conflicts++;     break;
                     case "resurrection": _resurrections++; break;
                     case "overwrite":    _overwrites++;    break;
+                    default:             _otherReviews++;  break;
                 }
                 InvokeAsync(StateHasChanged);
                 return;   // carries no byte data — skip the percent recompute below
@@ -161,6 +170,7 @@
         if (_conflicts > 0)     parts.Add($"{_conflicts} conflict{(_conflicts == 1 ? "" : "s")}");
         if (_resurrections > 0) parts.Add($"{_resurrections} resurrection{(_resurrections == 1 ? "" : "s")}");
         if (_overwrites > 0)    parts.Add($"{_overwrites} overwrite{(_overwrites == 1 ? "" : "s")}");
+        if (_otherReviews > 0)  parts.Add($"{_otherReviews} other");
         return string.Join(", ", parts);
     }
 

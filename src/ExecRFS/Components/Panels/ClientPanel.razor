@@ -80,7 +80,7 @@
             <div class="field-label">Archive Max Size (MB, 0 = no cap)</div>
             <input type="number" min="0"
                    value="@(Profile.ArchiveMaxBytes / 1048576)"
-                   @onchange="e => Profile.ArchiveMaxBytes = long.TryParse(e.Value?.ToString(), out var mb) && mb >= 0 ? mb * 1048576 : 0" />
+                   @onchange="OnArchiveMaxMbChanged" />
         </div>
     </div>
 
@@ -201,7 +201,18 @@
     protected override void OnInitialized()
     {
         ProcessManager.OnProgress += HandleProgress;
-        ProcessManager.OnStateChanged += _ => InvokeAsync(StateHasChanged);
+        ProcessManager.OnStateChanged += HandleStateChange;
+    }
+
+    private void HandleStateChange(SyncInstanceState state)
+    {
+        // Clear the previous run's review items only once a new run actually begins (Starting),
+        // not on the Start click. A no-op Start (the client is still alive and streaming the
+        // previous run's review events after "complete") never emits Starting, so it won't wipe
+        // items the user is still reading; a failed start still emits Starting, so this stays
+        // consistent with ProgressBar's reset.
+        if (state == SyncInstanceState.Starting) _reviewItems.Clear();
+        InvokeAsync(StateHasChanged);
     }
 
     private void HandleProgress(ProgressEvent evt)
@@ -284,10 +295,17 @@
         return $"{b / 1024.0 / 1024:F1} MB";
     }
 
-    private void Start()
+    private void Start()  => ProcessManager.Start(Profile);
+
+    // Archive size is stored in bytes but edited in whole MB. Only rewrite when the MB value the
+    // user leaves actually differs from what is shown, so tabbing through the field never
+    // re-quantizes a byte-precise value set elsewhere; clamp to avoid long overflow on absurd input.
+    private void OnArchiveMaxMbChanged(ChangeEventArgs e)
     {
-        _reviewItems.Clear();   // clear the previous run's conflicts before a new run begins
-        ProcessManager.Start(Profile);
+        const long BytesPerMb = 1048576;
+        if (!long.TryParse(e.Value?.ToString(), out var mb) || mb < 0) return;
+        if (mb == Profile.ArchiveMaxBytes / BytesPerMb) return;   // unchanged in MB terms
+        Profile.ArchiveMaxBytes = mb <= long.MaxValue / BytesPerMb ? mb * BytesPerMb : long.MaxValue;
     }
     private void Pause()  => ProcessManager.Pause();
     private void Resume() => ProcessManager.Resume();
@@ -296,5 +314,6 @@
     public void Dispose()
     {
         ProcessManager.OnProgress -= HandleProgress;
+        ProcessManager.OnStateChanged -= HandleStateChange;
     }
 }
