@@ -633,9 +633,18 @@ public sealed class SyncClient
             }
             catch (Exception ex)
             {
-                _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}");
-                skippedFiles++;
+                // A non-disconnect failure mid-send — a locked or removed source file, a
+                // compression or disk error — is terminal for the phase, NOT a per-file skip.
+                // SendFileAsync may already have put a FileStart (and some chunks) on the wire
+                // before throwing, and the receiver sizes its loop positionally from the shared
+                // plan: continuing would leave it waiting for a file that never finishes and
+                // attribute every later file's frames and confirm to the wrong entry. Abort like
+                // the desync/disconnect paths above.
+                _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}. Aborting the " +
+                              "transfer phase to avoid a desynchronised stream.");
                 _progress.WriteFileEnd(action.RelativePath, success: false, error: ex.Message);
+                desynced = true;
+                break;
             }
         }
 
@@ -938,14 +947,16 @@ public sealed class SyncClient
     }
 
     /// <summary>
-    /// True when <paramref name="ex"/> means the socket itself is gone, as opposed to a
-    /// per-file failure (missing local file, checksum mismatch, sharing violation) that leaves
-    /// the connection usable for the next file in the loop. EndOfStreamException is the one
-    /// ProtocolHandler.ReadExactAsync raises itself, always for "the peer closed its end"; a
-    /// SocketException carried as IOException.InnerException is NetworkStream's wrapping of the
-    /// same condition on a write. A bare IOException is deliberately excluded — that is also
-    /// what a locked or unreadable source file throws, and misclassifying it here would abort
-    /// the whole transfer phase over one file instead of skipping just that file.
+    /// True when <paramref name="ex"/> means the socket itself is gone, as opposed to a local
+    /// per-file failure (missing local file, checksum mismatch, sharing violation).
+    /// EndOfStreamException is the one ProtocolHandler.ReadExactAsync raises itself, always for
+    /// "the peer closed its end"; a SocketException carried as IOException.InnerException is
+    /// NetworkStream's wrapping of the same condition on a write. A bare IOException is
+    /// deliberately excluded — that is also what a locked or unreadable source file throws.
+    /// Both cases are now terminal for the transfer phase (a silently skipped file would desync
+    /// the positional frame stream), so this predicate no longer decides skip-vs-abort; it only
+    /// picks the diagnostic message — a real disconnect reports that the peer likely rejected the
+    /// plan, a local failure names the file that could not be read.
     /// </summary>
     private static bool IsPeerDisconnect(Exception ex) =>
         ex is EndOfStreamException
