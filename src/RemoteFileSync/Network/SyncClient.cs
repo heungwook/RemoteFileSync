@@ -299,13 +299,13 @@ public sealed class SyncClient
         var clientManifestBytes = ProtocolHandler.SerializeManifest(clientManifest);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.Manifest, clientManifestBytes, ct);
 
-        // 5. Receive server manifest
+        // 4. Receive server manifest
         var (mType, mData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         var serverManifest = ProtocolHandler.DeserializeManifest(mData);
         _logger.Info($"Remote manifest: {serverManifest.Count} files");
         _progress.WriteManifest("remote", serverManifest.Count, serverManifest.Entries.Sum(e => e.FileSize));
 
-        // 6. Compute sync plan and send
+        // 5. Compute sync plan and send
         // A null ancestor table is the honest signal for "we do not know what changed", and the
         // engine refuses to emit any deletion on that path.
         // `skew` is the measured client-vs-server clock offset from the v3 handshake above.
@@ -631,15 +631,17 @@ public sealed class SyncClient
                 desynced = true;
                 break;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // A non-disconnect failure mid-send — a locked or removed source file, a
-                // compression or disk error — is terminal for the phase, NOT a per-file skip.
-                // SendFileAsync may already have put a FileStart (and some chunks) on the wire
-                // before throwing, and the receiver sizes its loop positionally from the shared
-                // plan: continuing would leave it waiting for a file that never finishes and
+                // A non-disconnect, non-cancellation failure mid-send — a locked or removed source
+                // file, a compression or disk error — is terminal for the phase, NOT a per-file
+                // skip. SendFileAsync may already have put a FileStart (and some chunks) on the
+                // wire before throwing, and the receiver sizes its loop positionally from the
+                // shared plan: continuing would leave it waiting for a file that never finishes and
                 // attribute every later file's frames and confirm to the wrong entry. Abort like
-                // the desync/disconnect paths above.
+                // the desync/disconnect paths above. Cancellation is deliberately excluded (as the
+                // receive loop below does) so Ctrl+C / stop / timeout propagate to Program's
+                // cancellation handler instead of being reported as a fatal protocol desync.
                 _logger.Error($"Failed to send {action.RelativePath}: {ex.Message}. Aborting the " +
                               "transfer phase to avoid a desynchronised stream.");
                 _progress.WriteFileEnd(action.RelativePath, success: false, error: ex.Message);
