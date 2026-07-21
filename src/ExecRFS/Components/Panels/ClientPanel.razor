@@ -38,18 +38,50 @@
                   ValueChanged="@(v => Profile.ClientBackupFolder = v)"
                   Placeholder="Leave empty for default (.rfs-backups-NAME, beside the sync folder)" />
 
-    @* Bidirectional + Delete *@
+    @* Mode *@
+    <div class="field">
+        <div class="field-label">Mode</div>
+        <select value="@((int)Profile.EffectiveMode)"
+                @onchange="e => Profile.Mode = (SyncMode)(int.TryParse(e.Value?.ToString(), out var m) ? m : 1)">
+            <option value="1">Push (client → server)</option>
+            <option value="2">Pull (server → client)</option>
+            <option value="3">Two-way (merge)</option>
+        </select>
+    </div>
+
+    @* Delete + Mirror *@
     <div class="checkbox-row">
-        <label class="checkbox-label">
-            <input type="checkbox" checked="@Profile.Bidirectional"
-                   @onchange="e => Profile.Bidirectional = (bool)(e.Value ?? false)" />
-            Bidirectional
-        </label>
         <label class="checkbox-label">
             <input type="checkbox" checked="@Profile.DeleteEnabled"
                    @onchange="e => Profile.DeleteEnabled = (bool)(e.Value ?? false)" />
             Delete Propagation
         </label>
+        <label class="checkbox-label">
+            <input type="checkbox" checked="@Profile.MirrorDeletes"
+                   @onchange="e => Profile.MirrorDeletes = (bool)(e.Value ?? false)" />
+            Mirror Deletes
+        </label>
+    </div>
+
+    @* Archive (protects overwritten / conflicting copies) *@
+    <FolderPicker Label="Archive Folder (optional)"
+                  Value="@Profile.ArchiveFolder"
+                  ValueChanged="@(v => Profile.ArchiveFolder = v)"
+                  Placeholder="Leave empty for default (.rfs-archive-NAME, beside the sync folder)" />
+
+    <div class="field-grid" style="margin-bottom:8px;">
+        <div class="field">
+            <div class="field-label">Archive Keep Days (0 = forever)</div>
+            <input type="number" min="0"
+                   value="@Profile.ArchiveKeepDays"
+                   @onchange="e => Profile.ArchiveKeepDays = int.TryParse(e.Value?.ToString(), out var d) && d >= 0 ? d : 30" />
+        </div>
+        <div class="field">
+            <div class="field-label">Archive Max Size (MB, 0 = no cap)</div>
+            <input type="number" min="0"
+                   value="@(Profile.ArchiveMaxBytes / 1048576)"
+                   @onchange="e => Profile.ArchiveMaxBytes = long.TryParse(e.Value?.ToString(), out var mb) && mb >= 0 ? mb * 1048576 : 0" />
+        </div>
     </div>
 
     @* Block Size + Max Threads *@
@@ -114,6 +146,23 @@
         </div>
     }
 
+    @* Conflicts / resurrections / overwrites from the last run (emitted after "complete") *@
+    @if (_reviewItems.Count > 0)
+    {
+        <div class="thread-progress">
+            <div style="font-size:10px; color:var(--muted); margin-bottom:4px;">Review (@_reviewItems.Count)</div>
+            @foreach (var item in _reviewItems)
+            {
+                <div class="thread-row">
+                    <span style="color:var(--muted);">@ReviewLabel(item.Kind)</span>
+                    <span style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                          title="@item.Path">@System.IO.Path.GetFileName(item.Path)</span>
+                    <span style="color:var(--muted);">@ReviewDetail(item)</span>
+                </div>
+            }
+        </div>
+    }
+
     @* Controls *@
     <div style="display:flex; gap:6px; margin-top:8px;">
         @if (ProcessManager.State == SyncInstanceState.Idle ||
@@ -144,6 +193,10 @@
 
     private readonly Dictionary<int, TransferInfo> _activeTransfers = new();
     private record TransferInfo(string Path, long BytesSent, long TotalBytes, int Thread);
+
+    private readonly List<ReviewItem> _reviewItems = new();
+    private record ReviewItem(string Kind, string Path, long? ClientSize, string? ClientMtime,
+                              long? ServerSize, string? ServerMtime, string? RenamedTo);
 
     protected override void OnInitialized()
     {
@@ -178,6 +231,15 @@
             case "complete":
                 _activeTransfers.Clear();
                 break;
+
+            case "review":
+                // A conflict / resurrection / overwrite. These arrive AFTER "complete", so they
+                // must not be cleared there; Start() clears them when the next run begins. The
+                // item path reuses evt.Path.
+                _reviewItems.Add(new ReviewItem(
+                    evt.Kind ?? "", evt.Path ?? "",
+                    evt.ClientSize, evt.ClientMtime, evt.ServerSize, evt.ServerMtime, evt.RenamedTo));
+                break;
         }
         InvokeAsync(StateHasChanged);
     }
@@ -195,7 +257,38 @@
     private void OnHostChanged(ChangeEventArgs e)
         => Profile.ClientHost = e.Value?.ToString() ?? string.Empty;
 
-    private void Start()  => ProcessManager.Start(Profile);
+    private static string ReviewLabel(string kind) => kind switch
+    {
+        "conflict"     => "CONFLICT",
+        "resurrection" => "RESURRECTED",
+        "overwrite"    => "OVERWRITE",
+        _              => kind.ToUpperInvariant()
+    };
+
+    private static string ReviewDetail(ReviewItem item)
+    {
+        // A kept-both conflict names where the loser was preserved; otherwise show the two sizes.
+        if (!string.IsNullOrEmpty(item.RenamedTo))
+            return $"kept as {System.IO.Path.GetFileName(item.RenamedTo)}";
+        return $"local {FormatSize(item.ClientSize)} / remote {FormatSize(item.ServerSize)}";
+    }
+
+    // A size of -1 (paired with an empty mtime) is the CLI's "could not decode" sentinel: show
+    // "unknown", never a 0-byte file.
+    private static string FormatSize(long? size)
+    {
+        if (size is null or < 0) return "unknown";
+        var b = size.Value;
+        if (b < 1024) return $"{b} B";
+        if (b < 1024 * 1024) return $"{b / 1024.0:F1} KB";
+        return $"{b / 1024.0 / 1024:F1} MB";
+    }
+
+    private void Start()
+    {
+        _reviewItems.Clear();   // clear the previous run's conflicts before a new run begins
+        ProcessManager.Start(Profile);
+    }
     private void Pause()  => ProcessManager.Pause();
     private void Resume() => ProcessManager.Resume();
     private void Stop()   => ProcessManager.Stop();
