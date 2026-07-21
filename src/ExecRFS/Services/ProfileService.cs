@@ -36,7 +36,19 @@ public partial class ProfileService
     {
         var path = Path.Combine(_profileDir, SanitizeFileName(name) + ".json");
         if (!File.Exists(path)) throw new FileNotFoundException($"Profile not found: {name}");
-        return JsonSerializer.Deserialize<SyncProfile>(File.ReadAllText(path), JsonOpts) ?? new();
+        return Migrate(JsonSerializer.Deserialize<SyncProfile>(File.ReadAllText(path), JsonOpts) ?? new());
+    }
+
+    /// <summary>
+    /// Brings a profile loaded from disk up to date. A profile written before <see cref="SyncProfile.Mode"/>
+    /// existed has only <see cref="SyncProfile.Bidirectional"/>; a corrupt or hand-edited one may
+    /// carry an out-of-range integer Mode. Stamping <see cref="SyncProfile.EffectiveMode"/> (which
+    /// validates) makes the profile self-describing and idempotent for a valid Mode.
+    /// </summary>
+    private static SyncProfile Migrate(SyncProfile p)
+    {
+        p.Mode = p.EffectiveMode;
+        return p;
     }
 
     public void Save(SyncProfile profile)
@@ -62,7 +74,7 @@ public partial class ProfileService
     {
         var path = Path.Combine(_profileDir, "_last-session.json");
         if (!File.Exists(path)) return new();
-        try { return JsonSerializer.Deserialize<SyncProfile>(File.ReadAllText(path), JsonOpts) ?? new(); }
+        try { return Migrate(JsonSerializer.Deserialize<SyncProfile>(File.ReadAllText(path), JsonOpts) ?? new()); }
         catch { return new(); }
     }
 

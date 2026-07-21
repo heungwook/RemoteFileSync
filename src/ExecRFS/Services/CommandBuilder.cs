@@ -18,8 +18,25 @@ public static class CommandBuilder
             sb.Append($" --bind \"{profile.ServerBindAddress}\"");
         var backupFolder = isServer ? profile.ServerBackupFolder : profile.ClientBackupFolder;
         if (!string.IsNullOrWhiteSpace(backupFolder)) sb.Append($" --backup-folder \"{backupFolder}\"");
-        if (!isServer && profile.Bidirectional) sb.Append(" --bidirectional");
+        // Direction, mirror and delete are client-only: the server derives mode and the mirror
+        // bit from the handshake, not from its own --mode/--mirror options. --mode replaces the
+        // deprecated --bidirectional; EffectiveMode migrates an old profile that only set
+        // Bidirectional. Push is the CLI default, so it is omitted (omit-defaults style).
+        if (!isServer && profile.EffectiveMode != SyncMode.Push)
+            sb.Append($" --mode {ModeToken(profile.EffectiveMode)}");
         if (!isServer && profile.DeleteEnabled) sb.Append(" --delete");
+        if (!isServer && profile.MirrorDeletes) sb.Append(" --mirror");
+
+        // Archive applies to whichever side overwrites or deletes — in a push (the CLI default)
+        // that is the SERVER — and each side reads --archive-* from its OWN options, not the wire.
+        // So these emit on both branches from the single Archive* profile fields; otherwise a
+        // server-side cap/retention/folder the user configured is silently ignored.
+        if (!string.IsNullOrWhiteSpace(profile.ArchiveFolder))
+            sb.Append($" --archive-folder \"{profile.ArchiveFolder}\"");
+        if (profile.ArchiveKeepDays != 30)
+            sb.Append($" --archive-keep-days {profile.ArchiveKeepDays}");
+        if (profile.ArchiveMaxBytes > 0)
+            sb.Append($" --archive-max-size {profile.ArchiveMaxBytes}");
         var blockSize = isServer ? profile.ServerBlockSize : profile.ClientBlockSize;
         if (blockSize != 65536) sb.Append($" --block-size {blockSize}");
         var maxThreads = isServer ? profile.ServerMaxThreads : profile.ClientMaxThreads;
@@ -31,6 +48,13 @@ public static class CommandBuilder
         if (!string.IsNullOrWhiteSpace(logFile)) sb.Append($" --log \"{logFile}\"");
         return sb.ToString();
     }
+
+    private static string ModeToken(SyncMode mode) => mode switch
+    {
+        SyncMode.Pull => "pull",
+        SyncMode.TwoWay => "two-way",
+        _ => "push",
+    };
 
     public static string BuildForProcess(SyncProfile profile, bool isServer)
         => Build(profile, isServer) + " --json-progress";
