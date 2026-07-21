@@ -4,7 +4,6 @@ using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
 using RemoteFileSync.Progress;
-using RemoteFileSync.Security;
 using RemoteFileSync.State;
 using RemoteFileSync.Sync;
 using RemoteFileSync.Transfer;
@@ -15,7 +14,6 @@ public sealed class SyncClient
 {
     private readonly SyncOptions _options;
     private readonly SyncLogger _logger;
-    private readonly SyncStateManager? _stateManager;
     private readonly JsonProgressWriter _progress;
     private readonly StdinCommandReader _stdinReader;
     // Not readonly: when the caller supplies a path instead of an instance, RunAsync opens the
@@ -35,7 +33,6 @@ public sealed class SyncClient
     /// (and thereby creates) the file, and lets it write pair.marker on a clean exit.
     /// </param>
     public SyncClient(SyncOptions options, SyncLogger logger,
-                      SyncStateManager? stateManager = null,
                       JsonProgressWriter? progressWriter = null,
                       StdinCommandReader? stdinReader = null,
                       SyncDatabase? db = null,
@@ -43,7 +40,6 @@ public sealed class SyncClient
     {
         _options = options;
         _logger = logger;
-        _stateManager = stateManager;
         _progress = progressWriter ?? JsonProgressWriter.Null;
         _stdinReader = stdinReader ?? StdinCommandReader.Null;
         _db = db;
@@ -302,18 +298,7 @@ public sealed class SyncClient
             _logger.Info($"Sync session started (id={sessionId})");
         }
 
-        // 3. Load previous state (if delete enabled)
-        SyncState? previousState = null;
-        if (_options.DeleteEnabled && _stateManager != null)
-        {
-            previousState = _stateManager.LoadState(_options.Folder, _options.Host!, _options.Port);
-            if (previousState == null)
-                _logger.Info("No previous sync state found. First run with --delete: fully additive.");
-            else
-                _logger.Info($"Loaded sync state: {previousState.Manifest.Count} files from {previousState.LastSyncUtc:u}");
-        }
-
-        // 4. Scan local folder and send client manifest
+        // 3. Scan local folder and send client manifest
         var scanner = new FileScanner(_options.Folder, _options.IncludePatterns, _options.ExcludePatterns);
         var clientManifest = scanner.Scan();
         _logger.Info($"Local manifest: {clientManifest.Count} files");
@@ -929,14 +914,6 @@ public sealed class SyncClient
         // archive.SessionRoot lets the report name where an overwritten local copy was archived.
         ReviewReport.Emit(_db, sessionId, _logger, _progress,
             planResult.Overwrites, archive.SessionRoot);
-
-        // Fallback: save binary state when db is null (backward compat)
-        if (_db == null && exitCode == 0 && _options.DeleteEnabled && _stateManager != null)
-        {
-            var mergedManifest = SyncEngine.BuildMergedManifest(clientManifest, serverManifest, syncPlan);
-            _stateManager.SaveState(_options.Folder, _options.Host!, _options.Port, mergedManifest, DateTime.UtcNow);
-            _logger.Debug($"Sync state saved: {mergedManifest.Count} files");
-        }
 
         return exitCode;
         }

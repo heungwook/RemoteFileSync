@@ -612,18 +612,4 @@ public class SyncEngineTests
         Assert.Equal(SyncActionType.SendToServer, Assert.Single(result.Entries).Action);
         Assert.Empty(result.Overwrites);
     }
-
-    // ── BuildMergedManifest ──────────────────────────────────────────────────
-
-    [Fact]
-    public void BuildMergedManifest_ConflictKeepBoth_KeepsClientEntry()
-    {
-        // The renamed loser is written into the sync folder and picked up by the next scan; the
-        // merged manifest records the winner so the path is not dropped from tracking entirely.
-        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
-        var server = MakeManifest(new FileEntry("f.txt", 220, T2.AddMinutes(5)));
-        var plan = new List<SyncPlanEntry> { new(SyncActionType.ConflictKeepBoth, "f.txt") };
-        var merged = SyncEngine.BuildMergedManifest(client, server, plan);
-        Assert.Equal(150, merged.Get("f.txt")!.FileSize);
-    }
 }

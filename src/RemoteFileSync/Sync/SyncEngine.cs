@@ -272,45 +272,4 @@ public static class SyncEngine
         return Math.Abs((client.LastModifiedUtc - normalised).TotalSeconds)
                <= ChangeDetector.Tolerance.TotalSeconds;
     }
-
-    public static FileManifest BuildMergedManifest(
-        FileManifest clientManifest,
-        FileManifest serverManifest,
-        List<SyncPlanEntry> syncPlan)
-    {
-        var merged = new FileManifest();
-        foreach (var entry in syncPlan)
-        {
-            switch (entry.Action)
-            {
-                case SyncActionType.Skip:
-                case SyncActionType.SendToServer:
-                case SyncActionType.ClientOnly:
-                    var clientEntry = clientManifest.Get(entry.RelativePath);
-                    if (clientEntry != null) merged.Add(clientEntry);
-                    break;
-                case SyncActionType.SendToClient:
-                case SyncActionType.ServerOnly:
-                    var serverEntry = serverManifest.Get(entry.RelativePath);
-                    if (serverEntry != null) merged.Add(serverEntry);
-                    break;
-                case SyncActionType.ConflictKeepBoth:
-                    // Not reachable from this method's only caller: BuildMergedManifest runs
-                    // solely on SyncClient's `_db == null` fallback, where ComputePlan routes
-                    // TwoWay through PlanNoAncestor — which never emits ConflictKeepBoth — and
-                    // Push/Pull never emit it either. Kept as a defensive no-op (and to pin the
-                    // direct unit test below) rather than deleted, since a lookup here would
-                    // return null anyway: a surviving ConflictKeepBoth entry's RelativePath is
-                    // already the CONFLICT name after ConflictKeepBothExecutor.Expand, not the
-                    // original path this switch is keyed on.
-                    var conflictEntry = clientManifest.Get(entry.RelativePath);
-                    if (conflictEntry != null) merged.Add(conflictEntry);
-                    break;
-                case SyncActionType.DeleteOnServer:
-                case SyncActionType.DeleteOnClient:
-                    break;
-            }
-        }
-        return merged;
-    }
 }
