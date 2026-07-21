@@ -129,6 +129,12 @@ public sealed class SyncServer
         int skippedFiles = 0;
         bool stopped = false;
 
+        // ONE clock read for the whole run. Everything stamped with this instant — the archive
+        // session folder below and the conflict-rename filenames a later phase adds — must
+        // agree, or a run longer than a second scatters its own output across two session
+        // names and neither is a complete restore point.
+        var sessionStartUtc = DateTime.UtcNow;
+
         // 1. Receive handshake
         var (hsType, hsData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
         if (hsType != MessageType.Handshake)
@@ -136,14 +142,51 @@ public sealed class SyncServer
             _logger.Error($"Expected Handshake, got {hsType}");
             return 3;
         }
-        var (version, syncMode) = ProtocolHandler.DeserializeHandshake(hsData);
-        bool bidirectional = (syncMode & 1) != 0;
-        bool deleteEnabled = (syncMode & 2) != 0;
-        _logger.Info($"Handshake: v{version}, {(bidirectional ? "bidirectional" : "unidirectional")}");
+        byte version;
+        byte syncMode;
+        try
+        {
+            (version, syncMode, _) = ProtocolHandler.DeserializeHandshake(hsData);
+        }
+        catch (InvalidDataException)
+        {
+            // A v2 client's handshake is 2 bytes, which the v3 length guard rejects before its
+            // version byte can be read, so the versionOk path below cannot report the mismatch.
+            // Answer with a well-formed rejecting ack anyway: otherwise the accept loop's
+            // catch-all closes the socket and the peer reports an unexplained disconnect
+            // instead of "upgrade both sides".
+            await ProtocolHandler.WriteMessageAsync(stream, MessageType.HandshakeAck,
+                ProtocolHandler.SerializeHandshakeAck(
+                    ProtocolHandler.ProtocolVersion, accepted: false, DateTime.UtcNow.Ticks), ct);
+            _logger.Error("Rejected client: its handshake is shorter than protocol " +
+                          $"v{ProtocolHandler.ProtocolVersion} requires — the peer is an older build.");
+            return 3;
+        }
+
+        // Clamped through a switch rather than cast: syncMode arrives from an unauthenticated
+        // peer and 0 is not a defined SyncMode member, so a raw cast would yield an enum value
+        // that every later "== SyncMode.Push" comparison reads as "not Push" and admits writes
+        // to the server's tree on.
+        var mode = (syncMode & 0b11) switch
+        {
+            2 => SyncMode.Pull,
+            3 => SyncMode.TwoWay,
+            _ => SyncMode.Push,
+        };
+        bool deleteEnabled = (syncMode & 4) != 0;
+        // Decoded for reporting only. The server executes the plan the client computed, and the
+        // mirror decision is already baked into that plan, so acting on this bit here would
+        // apply the rule twice. Kept as a named local so the log line and Phase 8's server-side
+        // delete accounting read the same value.
+        bool mirrorDeletes = (syncMode & 8) != 0;
+        _logger.Info($"Handshake: v{version}, mode={mode}" +
+                     (deleteEnabled ? " +delete" : "") + (mirrorDeletes ? " +mirror" : ""));
 
         // 2. Send HandshakeAck — reject version mismatches rather than misparse frames.
+        // serverTicks is stamped at send time so the client's round-trip halving is honest.
         bool versionOk = version == ProtocolHandler.ProtocolVersion;
-        var ackPayload = ProtocolHandler.SerializeHandshakeAck(ProtocolHandler.ProtocolVersion, accepted: versionOk);
+        var ackPayload = ProtocolHandler.SerializeHandshakeAck(
+            ProtocolHandler.ProtocolVersion, accepted: versionOk, DateTime.UtcNow.Ticks);
         await ProtocolHandler.WriteMessageAsync(stream, MessageType.HandshakeAck, ackPayload, ct);
         if (!versionOk)
         {
@@ -170,16 +213,138 @@ public sealed class SyncServer
         var syncPlan = ProtocolHandler.DeserializeSyncPlan(pData);
         _logger.Info($"Sync plan: {syncPlan.Count} actions");
 
-        var backup = new BackupManager(_options.Folder, _options.EffectiveBackupFolder);
+        // The plan arrives from a peer we do not authenticate, so the server enforces its own
+        // bound instead of trusting the client's. BOTH directions are bounded: in Pull mode every
+        // deletion is a DeleteOnClient the server itself originates, and the previous guard
+        // counted only DeleteOnServer, so nothing checked those at all. Checked here, before the
+        // receive loop, so a refusal happens before any file is written or removed.
+        //
+        // The two denominators are NOT equally trustworthy. serverManifest.Count is this
+        // machine's own scan and is authoritative for the deletions applied here. clientManifest
+        // .Count arrived over the wire, so a peer can inflate it to buy itself a larger
+        // DeleteOnClient budget — this bound is therefore a backstop, not the primary defence.
+        // The client enforces the same bound against its own scan before applying any of them,
+        // which is the check that cannot be relaxed by lying to us.
+        if (deleteEnabled && !_options.ForceDelete)
+        {
+            // Counted only when this mode will actually execute that direction's delete loop —
+            // gated the same way the loops themselves are below. In Push mode no DeleteOnClient
+            // frame is ever sent, so a plan carrying them (malformed or hostile) must not abort
+            // the session over a deletion the mode gate would have dropped anyway; ungated, it
+            // did, and the client then blocked on ReadMessageAsync waiting for a DeleteFile that
+            // this early return meant the server would never send.
+            int plannedServerDeletes = ModeGate.ClientToServer(mode)
+                ? syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer) : 0;
+            int plannedClientDeletes = ModeGate.ServerToClient(mode)
+                ? syncPlan.Count(p => p.Action == SyncActionType.DeleteOnClient) : 0;
+            if (!WithinDeleteBudget(plannedServerDeletes, serverManifest.Count, "server")) return 4;
+            if (!WithinDeleteBudget(plannedClientDeletes, clientManifest.Count, "client")) return 4;
+        }
+
+        // Retention runs here, before the first archive write and before the first transfer,
+        // so the session folder this run is about to create can never be a prune candidate.
+        // TimeSpan.Zero — never TimeSpan.MaxValue — is the "keep forever" sentinel:
+        // DateTime.UtcNow - TimeSpan.MaxValue throws and would abort the sync at session start.
+        var keepAge = _options.ArchiveKeepDays > 0
+            ? TimeSpan.FromDays(_options.ArchiveKeepDays)
+            : TimeSpan.Zero;
+        var pruned = ArchiveManager.Prune(_options.EffectiveArchiveFolder, keepAge, _options.ArchiveMaxBytes);
+        if (pruned.SessionsRemoved > 0)
+            _logger.Info($"Archive retention: removed {pruned.SessionsRemoved} session(s), " +
+                         $"freed {pruned.BytesFreed / 1024} KB.");
+
+        // The single ArchiveManager for this session. Later phases REUSE this local; a second
+        // instance means a second session folder for the same run.
+        var archive = new ArchiveManager(_options.Folder, _options.EffectiveArchiveFolder, sessionStartUtc);
         var receiver = new FileTransferReceiver(_options.Folder);
         var sender = new FileTransferSender(_options.Folder, _options.BlockSize);
         int filesTransferred = 0;
         long bytesTransferred = 0;
         int filesDeleted = 0;
 
-        // 6. Receive files from client (SendToServer + ClientOnly)
-        var toReceive = syncPlan.Where(p =>
-            p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList();
+        // 5a. Conflict renames. Mirror of the client's step 6b: frame-free, and completed before
+        // the first file frame so both peers' transfer sets stay aligned.
+        var conflictEntries = syncPlan.Where(p => p.Action == SyncActionType.ConflictKeepBoth).ToList();
+        if (conflictEntries.Count > 0)
+        {
+            // The server only ever sends in the TwoWay branch below, so a conflict from a Push or
+            // Pull peer would strand the renamed loser here with no phase to carry it back.
+            if (mode != SyncMode.TwoWay)
+            {
+                var msg = $"Rejecting sync plan: {conflictEntries.Count} conflict action(s) from a " +
+                          $"{mode} peer, which has no phase to receive the renamed copy.";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            // Landing a conflict name on top of an existing local file replaces that file, which
+            // is a deletion in every way that matters. The plan comes from a peer we do not
+            // authenticate, so this guard bounds THAT case to the same two rules DeleteOnServer
+            // obeys: the negotiated delete flag and the budget. It does NOT bound conflict
+            // renames onto a FREE name — a hostile plan can still rename every file in the tree
+            // without tripping either rule, since nothing here is occupied. That is tolerated
+            // rather than closed because it is recoverable, not destructive: the original
+            // survives under the new name, plus a Conflict archive copy from the pre-rename
+            // snapshot below. Both `occupied` and `serverManifest.Count` are measured from THIS
+            // machine's own scan; nothing the peer sent is allowed to size the blast radius.
+            int occupied = ConflictKeepBothExecutor.CountOccupiedTargets(
+                syncPlan, ConflictNamer.ServerSide, _options.Folder);
+            if (occupied > 0 && !deleteEnabled)
+            {
+                var msg = $"Rejecting sync plan: {occupied} conflict name(s) would replace existing " +
+                          "local files, but the peer did not negotiate deletion.";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+            // The percentage bound is DeleteBudget.Within, not arithmetic written out again here.
+            // Squatter removal is a deletion by another name, so it must obey the byte-identical
+            // rule the DeleteOnServer guard obeys — including the two edge cases a hand-rolled
+            // `pct > max` gets wrong: a zero denominator refuses rather than disarming, and a
+            // population below MinTrackedFilesForDeleteGuard is exempt because the percentage
+            // there is noise.
+            if (!_options.ForceDelete
+                && !DeleteBudget.Within(occupied, serverManifest.Count, _options.MaxDeletePercent))
+            {
+                var msg = $"Rejecting sync plan: peer's conflict names would replace {occupied} of " +
+                          $"{serverManifest.Count} local files, exceeding this server's " +
+                          $"--max-delete-percent {_options.MaxDeletePercent}.";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            // `archive` is the session's one ArchiveManager. Constructing another here would
+            // shadow it and split this run's restore point across two session folders.
+            var conflictOutcome = ConflictKeepBothExecutor.ApplyLocalRenames(
+                syncPlan, ConflictNamer.ServerSide, _options.Folder, archive);
+
+            // See SyncClient step 6b: the plan already promised a transfer under the conflict
+            // name, so a half-applied rename hangs the peer rather than merely skipping a file.
+            if (conflictOutcome.Failures.Count > 0)
+            {
+                var msg = $"Refusing to sync: conflict rename failed for {conflictOutcome.Failures.Count} " +
+                          $"path(s): {string.Join("; ", conflictOutcome.Failures)}";
+                _logger.Error(msg);
+                _progress.WriteError(msg, fatal: true);
+                return 4;
+            }
+
+            foreach (var path in conflictOutcome.NotArchived)
+                _logger.Warning($"Conflict copy of {path} was renamed but could not be archived first.");
+
+            if (conflictOutcome.Renamed > 0)
+                _logger.Info($"Conflict: {conflictOutcome.Renamed} losing copy/copies renamed and kept.");
+        }
+
+        // 6. Receive files from client (SendToServer + ClientOnly). Mirror of the client's send
+        // gate: the peer is unauthenticated, so the plan it sent is not trusted to be internally
+        // consistent with the mode it declared in the handshake.
+        var toReceive = ModeGate.ClientToServer(mode)
+            ? syncPlan.Where(p =>
+                p.Action == SyncActionType.SendToServer || p.Action == SyncActionType.ClientOnly).ToList()
+            : new List<SyncPlanEntry>();
 
         foreach (var action in toReceive)
         {
@@ -190,7 +355,21 @@ public sealed class SyncServer
             try
             {
                 result = await receiver.ReceiveFileAsync(stream, ct,
-                    onBeforeCommit: p => action.Action == SyncActionType.SendToServer && backup.BackupFile(p));
+                    onBeforeCommit: p =>
+                    {
+                        // `action.Action` is the peer's label for this path, deserialized from
+                        // syncPlan — not a fact about our filesystem. A hostile or buggy peer
+                        // that mislabels an overwrite as ClientOnly must not skip the archive:
+                        // TryArchive itself checks the LOCAL file and returns NothingToArchive
+                        // when there truly is nothing to protect, so gating on the peer's label
+                        // instead would let that peer get a local file overwritten with no
+                        // archived copy.
+                        var outcome = archive.TryArchive(p, ArchiveReason.Overwritten, removeOriginal: false);
+                        if (outcome == ArchiveOutcome.Failed)
+                            _logger.Error($"Pre-overwrite archive failed for {p}; " +
+                                          "refusing to overwrite the local copy.");
+                        return outcome != ArchiveOutcome.Failed;
+                    });
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -218,27 +397,11 @@ public sealed class SyncServer
             await ProtocolHandler.WriteMessageAsync(stream, MessageType.BackupConfirm, confirm, ct);
         }
 
-        // 7. Deletion Phase (Server): Receive DeleteFile from client for DeleteOnServer actions
-        if (deleteEnabled)
+        // 7. Deletion Phase (Server): Receive DeleteFile from client for DeleteOnServer actions.
+        // The bound now lives above, before the receive loop. Gated on the same predicate as the
+        // client's matching send loop.
+        if (deleteEnabled && ModeGate.ClientToServer(mode))
         {
-            // The plan arrives over the wire from a peer we do not authenticate, so the server
-            // enforces its own bound rather than trusting the client's guard.
-            int requested = syncPlan.Count(p => p.Action == SyncActionType.DeleteOnServer);
-            if (requested > 0 && serverManifest.Count >= SyncOptions.MinTrackedFilesForDeleteGuard
-                && !_options.ForceDelete)
-            {
-                double pct = requested * 100.0 / serverManifest.Count;
-                if (pct > _options.MaxDeletePercent)
-                {
-                    var msg = $"Rejecting sync plan: peer requested deletion of {requested} of " +
-                              $"{serverManifest.Count} local files ({pct:F0}%), exceeding " +
-                              $"--max-delete-percent {_options.MaxDeletePercent}.";
-                    _logger.Error(msg);
-                    _progress.WriteError(msg, fatal: true);
-                    return 4;
-                }
-            }
-
             var serverDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnServer).ToList();
             foreach (var del in serverDeletes)
             {
@@ -253,41 +416,48 @@ public sealed class SyncServer
 
                 var (path, backupFirst) = ProtocolHandler.DeserializeDeleteFile(delData);
                 bool success = false;
+
+                // The budget above bounds the COUNT of deletions the plan approved; it says
+                // nothing about which PATHS. `del` is the entry that count was computed from, and
+                // DeleteFile frames arrive in the same order this loop iterates `serverDeletes`,
+                // so a wire path that does not match `del.RelativePath` names a file the approved
+                // plan never listed — a hostile or buggy client could otherwise delete any N
+                // in-folder files it likes, where N is merely the approved count. PathGuard (via
+                // Archive below) only keeps the result inside the sync root; it does not check
+                // that the path was ever planned, which is the check this is.
+                if (!string.Equals(path, del.RelativePath, StringComparison.Ordinal))
+                {
+                    _logger.Warning($"Protocol mismatch: expected DeleteFile for {del.RelativePath} " +
+                                    $"(next in plan order), got {path}. Refusing to delete a path " +
+                                    "the approved plan did not list.");
+                    skippedFiles++;
+                    var mismatchConfirm = ProtocolHandler.SerializeDeleteConfirm(path, success: false);
+                    await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteConfirm, mismatchConfirm, ct);
+                    continue;
+                }
+
                 try
                 {
-                    if (backupFirst)
+                    // `backupFirst` is decoded from the wire and DELIBERATELY IGNORED. It stays
+                    // in the protocol so old peers keep parsing DeleteFile, but it no longer
+                    // selects a delete-without-archive path: our own client always sends true,
+                    // so that path was reachable only from a hostile or buggy peer, and all it
+                    // could ever do is destroy a file with no restore point. Archive() already
+                    // performs the same PathGuard containment check against _options.Folder and
+                    // returns false when it fails, so the separate guard branch that used to sit
+                    // here is redundant, not lost.
+                    if (archive.Archive(path, ArchiveReason.Deleted, removeOriginal: true))
                     {
-                        if (backup.BackupAndRemove(path))
-                        {
-                            success = true;
-                            filesDeleted++;
-                            _logger.Info($"[DEL] {path}");
-                        }
-                        else
-                        {
-                            _logger.Warning($"File not found for backup/delete: {path}. Skipping.");
-                            skippedFiles++;
-                        }
-                    }
-                    else if (!PathGuard.TryResolveWithinRoot(_options.Folder, path, out var fullPath))
-                    {
-                        _logger.Error($"Rejected delete for path outside sync root: {path}");
-                        skippedFiles++;
+                        success = true;
+                        filesDeleted++;
+                        _logger.Info($"[DEL] {path}");
                     }
                     else
                     {
-                        if (File.Exists(fullPath))
-                        {
-                            File.Delete(fullPath);
-                            success = true;
-                            filesDeleted++;
-                            _logger.Info($"[DEL] {path}");
-                        }
-                        else
-                        {
-                            _logger.Warning($"File not found for delete: {path}. Skipping.");
-                            skippedFiles++;
-                        }
+                        // Not found, outside the sync root, or unarchivable — in every case we
+                        // decline to delete rather than delete unprotected.
+                        _logger.Warning($"Could not archive {path} for deletion. Skipping.");
+                        skippedFiles++;
                     }
                 }
                 catch (Exception ex)
@@ -301,8 +471,9 @@ public sealed class SyncServer
             }
         }
 
-        // 8. Send files to client (SendToClient + ServerOnly) if bidirectional
-        if (bidirectional)
+        // 8. Send files to client (SendToClient + ServerOnly). Mirrors the client's receive gate;
+        // both sides must derive it from `mode` or the frame counts diverge.
+        if (ModeGate.ServerToClient(mode))
         {
             var toSend = syncPlan.Where(p =>
                 p.Action == SyncActionType.SendToClient || p.Action == SyncActionType.ServerOnly).ToList();
@@ -352,8 +523,9 @@ public sealed class SyncServer
             }
         }
 
-        // 9. Deletion Phase (Client): Send DeleteFile for DeleteOnClient actions
-        if (deleteEnabled && bidirectional)
+        // 9. Deletion Phase (Client): Send DeleteFile for DeleteOnClient actions. Must use the
+        // identical predicate to the client's receive gate, or one side blocks on the other.
+        if (deleteEnabled && ModeGate.ServerToClient(mode))
         {
             var clientDeletes = syncPlan.Where(p => p.Action == SyncActionType.DeleteOnClient).ToList();
             foreach (var del in clientDeletes)
@@ -390,5 +562,23 @@ public sealed class SyncServer
         var deletedSummary = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
         _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedSummary}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
         return exitCode;
+    }
+
+    /// <summary>
+    /// Percentage bound for one direction. <paramref name="destinationCount"/> is the file count
+    /// on the side being deleted from; for the client that is the manifest it just sent us, which
+    /// is the only view of the client's population this server has.
+    /// </summary>
+    private bool WithinDeleteBudget(int deletes, int destinationCount, string destinationLabel)
+    {
+        if (DeleteBudget.Within(deletes, destinationCount, _options.MaxDeletePercent)) return true;
+
+        var msg = $"Rejecting sync plan: it would delete {deletes} of {destinationCount} file(s) " +
+                  $"on the {destinationLabel}, exceeding this server's --max-delete-percent " +
+                  $"{_options.MaxDeletePercent}. The server enforces this independently of the " +
+                  "client; an intentional bulk deletion needs --force-delete on both sides.";
+        _logger.Error(msg);
+        _progress.WriteError(msg, fatal: true);
+        return false;
     }
 }

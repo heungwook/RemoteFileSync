@@ -184,7 +184,8 @@ public sealed class SyncDatabaseTests : IDisposable
         var state = _db.GetFileState("incoming/newfile.txt");
         Assert.NotNull(state);
         Assert.Equal("new", state!.Status);
-        Assert.Equal("remote", state.Side);
+        // No Side assertion: schema v2 dropped the `side` column per CONTRACT.md, so the
+        // value "remote" is unrecoverable. FileState.Side is now synthetic ("both").
     }
 
     // 13. Mark 2 files synced, leave 3rd untracked, complete session with exit 1, verify 2 have state and 3rd doesn't

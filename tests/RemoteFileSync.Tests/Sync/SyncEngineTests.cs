@@ -1,6 +1,4 @@
-﻿using Microsoft.Data.Sqlite;
 using RemoteFileSync.Models;
-using RemoteFileSync.State;
 using RemoteFileSync.Sync;
 
 namespace RemoteFileSync.Tests.Sync;
@@ -10,10 +8,6 @@ public class SyncEngineTests
     private static readonly DateTime T1 = new(2026, 3, 26, 10, 0, 0, DateTimeKind.Utc);
     private static readonly DateTime T2 = new(2026, 3, 26, 12, 0, 0, DateTimeKind.Utc);
 
-    private static readonly DateTime LastSync = new(2026, 3, 26, 12, 0, 0, DateTimeKind.Utc);
-    private static readonly DateTime BeforeSync = new(2026, 3, 26, 10, 0, 0, DateTimeKind.Utc);
-    private static readonly DateTime AfterSync = new(2026, 3, 27, 8, 0, 0, DateTimeKind.Utc);
-
     private static FileManifest MakeManifest(params FileEntry[] entries)
     {
         var m = new FileManifest();
@@ -21,386 +15,615 @@ public class SyncEngineTests
         return m;
     }
 
+    /// <summary>Row for a file both sides agreed on at <paramref name="mtime"/>.</summary>
+    private static AncestorRow Row(string path, long size, DateTime mtime) =>
+        new(path, size, mtime.Ticks, size, mtime.Ticks, "exists", T1.Ticks, null);
+
+    /// <summary>Row for a file already tombstoned — must behave exactly like "no row".</summary>
+    private static AncestorRow Tombstoned(string path, long size, DateTime mtime) =>
+        new(path, size, mtime.Ticks, size, mtime.Ticks, "deleted", T1.Ticks, T1.Ticks);
+
+    /// <summary>
+    /// Row for a file discovered on one side but never confirmed as synced to the other. No
+    /// two-sided agreement it records ever happened, so it must route exactly like a missing row.
+    /// </summary>
+    private static AncestorRow NewRow(string path, long size, DateTime mtime) =>
+        new(path, size, mtime.Ticks, size, mtime.Ticks, "new", T1.Ticks, null);
+
+    private static Dictionary<string, AncestorRow> Ancestor(params AncestorRow[] rows) =>
+        rows.ToDictionary(r => r.Path, r => r, StringComparer.OrdinalIgnoreCase);
+
+    private static PlanResult Plan(
+        FileManifest client,
+        FileManifest server,
+        SyncMode mode,
+        IReadOnlyDictionary<string, AncestorRow>? ancestor,
+        bool deleteEnabled = true,
+        bool mirrorDeletes = false,
+        ClockSkew? skew = null) =>
+        SyncEngine.ComputePlan(client, server, mode, ancestor, deleteEnabled, mirrorDeletes,
+                               skew ?? ClockSkew.None);
+
+    private static Dictionary<string, SyncActionType> Actions(PlanResult result) =>
+        result.Entries.ToDictionary(p => p.RelativePath, p => p.Action,
+                                    StringComparer.OrdinalIgnoreCase);
+
+    // ── TwoWay, row present and Status == "exists" ────────────────────────────
+
     [Fact]
-    public void BothEmpty_EmptyPlan()
+    public void TwoWay_UnchangedBothSides_Skip()
     {
-        var plan = SyncEngine.ComputePlan(new FileManifest(), new FileManifest(), bidirectional: true);
-        Assert.Empty(plan);
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
     }
 
     [Fact]
-    public void IdenticalFiles_AllSkipped()
+    public void TwoWay_ClientChangedOnly_SendToServer()
     {
-        var client = MakeManifest(new FileEntry("a.txt", 100, T1));
-        var server = MakeManifest(new FileEntry("a.txt", 100, T1));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true);
-        Assert.All(plan, p => Assert.Equal(SyncActionType.Skip, p.Action));
+        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
+        Assert.Empty(result.Conflicts);
     }
 
     [Fact]
-    public void ClientOnly_Unidirectional_ProducesClientOnlyAction()
+    public void TwoWay_ServerChangedOnly_SendToClient()
     {
-        var client = MakeManifest(new FileEntry("new.txt", 50, T1));
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToClient, result.Entries[0].Action);
+    }
+
+    [Fact]
+    public void TwoWay_BothChanged_ConflictKeepBothAndRecordsBothSides()
+    {
+        // Both sides edited since the ancestor. Neither edit may be silently discarded, so the
+        // plan keeps both and the executor renames the loser. The conflict must also reach
+        // PlanResult with each side's real size/mtime, because that is the only place the
+        // review report can learn what the two copies were.
+        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2.AddMinutes(5)));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.ConflictKeepBoth, result.Entries[0].Action);
+
+        var conflict = Assert.Single(result.Conflicts);
+        Assert.Equal("f.txt", conflict.Path);
+        Assert.Equal(150, conflict.ClientSize);
+        Assert.Equal(T2.Ticks, conflict.ClientMtimeTicks);
+        Assert.Equal(220, conflict.ServerSize);
+        Assert.Equal(T2.AddMinutes(5).Ticks, conflict.ServerMtimeTicks);
+    }
+
+    [Fact]
+    public void TwoWay_ClientAbsent_ServerUnchanged_DeleteOnServer()
+    {
+        // The client deleted it and nobody touched the server copy, so the deletion is the only
+        // edit in play and it propagates.
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.DeleteOnServer, result.Entries[0].Action);
+        Assert.Equal("f.txt", result.Entries[0].RelativePath);
+        Assert.Empty(result.Resurrections);
+    }
+
+    [Fact]
+    public void TwoWay_ClientAbsent_ServerChanged_SendToClientAndRecordsResurrection()
+    {
+        // A delete on one side loses to a real edit on the other: losing the edit is
+        // unrecoverable, an unwanted resurrection costs one more delete. The kept copy is
+        // recorded so the review report can tell the user why the file came back.
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToClient, result.Entries[0].Action);
+
+        var res = Assert.Single(result.Resurrections);
+        Assert.Equal("f.txt", res.Path);
+        Assert.False(res.KeptClientCopy);
+        Assert.Equal(220, res.KeptSize);
+        Assert.Equal(T2.Ticks, res.KeptMtimeTicks);
+    }
+
+    [Fact]
+    public void TwoWay_ServerAbsent_ClientUnchanged_DeleteOnClient()
+    {
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
         var server = new FileManifest();
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: false);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.DeleteOnClient, result.Entries[0].Action);
+        Assert.Empty(result.Resurrections);
     }
 
     [Fact]
-    public void ServerOnly_Unidirectional_Ignored()
+    public void TwoWay_ServerAbsent_ClientChanged_SendToServerAndRecordsResurrection()
+    {
+        var client = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var server = new FileManifest();
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
+
+        var res = Assert.Single(result.Resurrections);
+        Assert.Equal("f.txt", res.Path);
+        Assert.True(res.KeptClientCopy);
+        Assert.Equal(220, res.KeptSize);
+        Assert.Equal(T2.Ticks, res.KeptMtimeTicks);
+    }
+
+    [Fact]
+    public void TwoWay_AbsentBothSides_NoPlanEntry()
+    {
+        // Both sides already removed it. There is nothing to transfer and nothing to delete;
+        // the caller tombstones the row. ComputePlan stays free of database writes.
+        var result = Plan(new FileManifest(), new FileManifest(), SyncMode.TwoWay,
+                          Ancestor(Row("f.txt", 100, T1)));
+        Assert.Empty(result.Entries);
+        Assert.Empty(result.Resurrections);
+        Assert.Empty(result.Conflicts);
+    }
+
+    [Fact]
+    public void TwoWay_SizeChangedMtimeIdentical_CountsAsChanged()
+    {
+        // An in-place rewrite keeps the mtime inside tolerance. Comparing mtimes alone returns
+        // Skip here and the larger client copy is never pushed.
+        var client = MakeManifest(new FileEntry("f.txt", 250, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
+    }
+
+    [Fact]
+    public void TwoWay_DeleteDisabled_ReCopiesInsteadOfDeleting()
+    {
+        // Without --delete the deletion must not propagate, but dropping the path from the plan
+        // would leave the two sides permanently divergent with no record of why.
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)),
+                          deleteEnabled: false);
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToClient, result.Entries[0].Action);
+    }
+
+    [Fact]
+    public void TwoWay_NewFileWithNoRow_TakesAdditivePath()
+    {
+        var ancestor = Ancestor(Row("existing.txt", 100, T1));
+        var client = MakeManifest(
+            new FileEntry("existing.txt", 100, T1),
+            new FileEntry("brand-new.txt", 50, T2));
+        var server = MakeManifest(new FileEntry("existing.txt", 100, T1));
+        var actions = Actions(Plan(client, server, SyncMode.TwoWay, ancestor));
+        Assert.Equal(SyncActionType.Skip, actions["existing.txt"]);
+        Assert.Equal(SyncActionType.SendToServer, actions["brand-new.txt"]);
+    }
+
+    // ── Status == "new" is a discovery, never an ancestor ─────────────────────
+
+    [Fact]
+    public void TwoWay_StatusNewRow_TreatedAsNoAncestor_NeverDeletes()
+    {
+        // A 'new' row records that one side was seen holding the file, not that both sides ever
+        // agreed on it — no sync it attests to happened. Dispatching on Status != "deleted"
+        // routes it down the delete-capable path, where client-present/server-absent reads as
+        // "the server deleted it" and the client copy is destroyed on the strength of a sync
+        // that never ran.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = new FileManifest();
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(NewRow("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
+    }
+
+    [Fact]
+    public void Pull_StatusNewRow_DoesNotLicenseDeletingClientFile()
+    {
+        // The Pull mirror, and the dangerous direction: this branch deletes out of the user's own
+        // local folder, so a 'new' row must not satisfy the "the server had it too" gate.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = new FileManifest();
+        var result = Plan(client, server, SyncMode.Pull, Ancestor(NewRow("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
+    }
+
+    [Fact]
+    public void Push_StatusNewRow_DoesNotLicenseDeletingServerFile()
     {
         var client = new FileManifest();
-        var server = MakeManifest(new FileEntry("only-server.txt", 50, T1));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: false);
-        Assert.DoesNotContain(plan, p => p.Action != SyncActionType.Skip);
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.Push, Ancestor(NewRow("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
     }
 
     [Fact]
-    public void ServerOnly_Bidirectional_ProducesServerOnlyAction()
+    public void StatusNewRow_AbsentBothSides_EmitsNothing()
     {
-        var client = new FileManifest();
-        var server = MakeManifest(new FileEntry("only-server.txt", 50, T1));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
+        // A 'new' row must not be seeded into the path set as though it were an agreed ancestor:
+        // that would plan an action for a path neither side holds.
+        var result = Plan(new FileManifest(), new FileManifest(), SyncMode.TwoWay,
+                          Ancestor(NewRow("f.txt", 100, T1)));
+        Assert.Empty(result.Entries);
+    }
+
+    // ── No ancestor (null table, missing row, or tombstoned row) ──────────────
+
+    [Fact]
+    public void NoAncestor_AdditiveOnly_NeverEmitsDelete()
+    {
+        var client = MakeManifest(new FileEntry("c-only.txt", 50, T1));
+        var server = MakeManifest(new FileEntry("s-only.txt", 50, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null, deleteEnabled: true);
+        var actions = Actions(result);
+        Assert.Equal(SyncActionType.SendToServer, actions["c-only.txt"]);
+        Assert.Equal(SyncActionType.SendToClient, actions["s-only.txt"]);
+        Assert.DoesNotContain(result.Entries, p => p.Action == SyncActionType.DeleteOnServer);
+        Assert.DoesNotContain(result.Entries, p => p.Action == SyncActionType.DeleteOnClient);
     }
 
     [Fact]
-    public void ClientNewer_SendToServer()
+    public void NoAncestor_BothPresent_NewestWins()
     {
         var client = MakeManifest(new FileEntry("f.txt", 100, T2));
         var server = MakeManifest(new FileEntry("f.txt", 100, T1));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.SendToServer, plan[0].Action);
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
     }
 
     [Fact]
-    public void ServerNewer_SendToClient()
+    public void NoAncestor_SameMtime_LargerWins()
     {
         var client = MakeManifest(new FileEntry("f.txt", 100, T1));
-        var server = MakeManifest(new FileEntry("f.txt", 100, T2));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.SendToClient, plan[0].Action);
+        var server = MakeManifest(new FileEntry("f.txt", 200, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToClient, result.Entries[0].Action);
     }
 
     [Fact]
-    public void MixedScenario_CorrectPlan()
+    public void TombstonedRow_TreatedAsNoAncestor_NeverDeletes()
     {
+        // A "deleted" row is settled history. Reading it as an ancestor would turn a file the
+        // user deliberately re-created into an immediate re-deletion.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T2));
+        var server = new FileManifest();
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Tombstoned("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
+    }
+
+    [Fact]
+    public void BothEmpty_EmptyPlan()
+    {
+        var result = Plan(new FileManifest(), new FileManifest(), SyncMode.TwoWay, ancestor: null);
+        Assert.Empty(result.Entries);
+    }
+
+    // ── Clock skew ───────────────────────────────────────────────────────────
+
+    [Fact]
+    public void ClockSkew_ServerOneHourFast_DoesNotWin()
+    {
+        // The server's clock is +1h. Its file is byte-identical and was written at the same real
+        // instant, but its raw mtime is an hour "newer", so it wins newest-wins forever and every
+        // run pulls the same bytes down again. The first half of this test proves the second half
+        // bites: with ClockSkew.None the engine really does return SendToClient.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T2.AddHours(1)));
+
+        var withoutSkew = Plan(client, server, SyncMode.TwoWay, ancestor: null,
+                               skew: ClockSkew.None);
+        Assert.Equal(SyncActionType.SendToClient, withoutSkew.Entries[0].Action);
+
+        var withSkew = Plan(client, server, SyncMode.TwoWay, ancestor: null,
+                            skew: new ClockSkew(TimeSpan.FromHours(1)));
+        Assert.Single(withSkew.Entries);
+        Assert.Equal(SyncActionType.Skip, withSkew.Entries[0].Action);
+    }
+
+    // ── Push (client authoritative) ──────────────────────────────────────────
+
+    [Fact]
+    public void Push_NeverEmitsClientSideActions()
+    {
+        var ancestor = Ancestor(Row("keep.txt", 100, T1), Row("gone.txt", 100, T1));
         var client = MakeManifest(
-            new FileEntry("same.txt", 100, T1),
-            new FileEntry("client-newer.txt", 100, T2),
-            new FileEntry("client-only.txt", 50, T1));
+            new FileEntry("keep.txt", 100, T1),
+            new FileEntry("push-me.txt", 50, T2));
         var server = MakeManifest(
-            new FileEntry("same.txt", 100, T1),
-            new FileEntry("client-newer.txt", 100, T1),
-            new FileEntry("server-only.txt", 50, T1));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true);
-        var actions = plan.ToDictionary(p => p.RelativePath, p => p.Action);
-        Assert.Equal(SyncActionType.Skip, actions["same.txt"]);
-        Assert.Equal(SyncActionType.SendToServer, actions["client-newer.txt"]);
-        Assert.Equal(SyncActionType.ClientOnly, actions["client-only.txt"]);
-        Assert.Equal(SyncActionType.ServerOnly, actions["server-only.txt"]);
+            new FileEntry("keep.txt", 100, T1),
+            new FileEntry("gone.txt", 100, T1),
+            new FileEntry("server-extra.txt", 100, T2));
+
+        var result = Plan(client, server, SyncMode.Push, ancestor);
+        var actions = Actions(result);
+
+        Assert.Equal(SyncActionType.Skip, actions["keep.txt"]);
+        Assert.Equal(SyncActionType.SendToServer, actions["push-me.txt"]);
+        Assert.Equal(SyncActionType.DeleteOnServer, actions["gone.txt"]);
+        // No row proves the client ever had it, so it is left alone rather than wiped.
+        Assert.Equal(SyncActionType.Skip, actions["server-extra.txt"]);
+
+        Assert.DoesNotContain(result.Entries, p => p.Action == SyncActionType.SendToClient);
+        Assert.DoesNotContain(result.Entries, p => p.Action == SyncActionType.DeleteOnClient);
     }
 
     [Fact]
-    public void DeletedOnClient_UntouchedOnServer_ProducesDeleteOnServer()
+    public void Push_UnknownDeletion_ServerEditedSinceAncestor_Skip()
     {
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        // The client copy is gone and a row proves the client once had it — but the server copy
+        // has been edited since that agreement. Deleting it destroys the only surviving version
+        // of that edit, and Push has no resurrection path to bring it back. CONTRACT.md's Push
+        // table requires the row to say the client had it AND that it is unchanged; checking
+        // only Status == "exists" is what this test catches.
         var client = new FileManifest();
-        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
-        Assert.Equal("file.txt", plan[0].RelativePath);
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var result = Plan(client, server, SyncMode.Push, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
     }
 
     [Fact]
-    public void DeletedOnClient_ModifiedOnServer_ProducesSendToClient()
+    public void Push_UnknownDeletion_ServerEditedButMirror_DeleteOnServer()
     {
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        // --mirror is the explicit "make the server match, whatever it is holding" opt-in, so it
+        // overrides the unchanged check as well as the row check.
         var client = new FileManifest();
-        var server = MakeManifest(new FileEntry("file.txt", 200, AfterSync));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.SendToClient, plan[0].Action);
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var result = Plan(client, server, SyncMode.Push, Ancestor(Row("f.txt", 100, T1)),
+                          mirrorDeletes: true);
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.DeleteOnServer, result.Entries[0].Action);
     }
 
     [Fact]
-    public void DeletedOnServer_UntouchedOnClient_ProducesDeleteOnClient()
+    public void Push_ServerChangedUnderneath_StillSendToServer()
     {
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
-        var client = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+        // Push means the server does not get a vote, even when its copy is the newer one.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var result = Plan(client, server, SyncMode.Push, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
+    }
+
+    [Fact]
+    public void Push_ServerLostFile_RePushed()
+    {
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
         var server = new FileManifest();
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.DeleteOnClient, plan[0].Action);
+        var result = Plan(client, server, SyncMode.Push, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToServer, result.Entries[0].Action);
     }
 
     [Fact]
-    public void DeletedOnServer_ModifiedOnClient_ProducesSendToServer()
-    {
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
-        var client = MakeManifest(new FileEntry("file.txt", 200, AfterSync));
-        var server = new FileManifest();
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.SendToServer, plan[0].Action);
-    }
-
-    [Fact]
-    public void BothDeleted_NoAction()
-    {
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
-        var client = new FileManifest();
-        var server = new FileManifest();
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
-        Assert.Empty(plan);
-    }
-
-    [Fact]
-    public void NoState_FullyAdditive()
+    public void Push_UnknownServerFile_WithMirror_DeleteOnServer()
     {
         var client = new FileManifest();
-        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: null, deleteEnabled: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
+        var server = MakeManifest(new FileEntry("stray.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.Push, ancestor: null, mirrorDeletes: true);
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.DeleteOnServer, result.Entries[0].Action);
     }
 
     [Fact]
-    public void UniDirectional_OnlyClientDeletionsPropagate()
+    public void Push_DeleteDisabled_KeepsServerFile()
     {
-        var snapshot = MakeManifest(
-            new FileEntry("client-deleted.txt", 100, BeforeSync),
-            new FileEntry("server-deleted.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
-        var client = MakeManifest(new FileEntry("server-deleted.txt", 100, BeforeSync));
-        var server = MakeManifest(new FileEntry("client-deleted.txt", 100, BeforeSync));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: false, previousState: state, deleteEnabled: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
-        Assert.Equal("client-deleted.txt", plan[0].RelativePath);
+        var client = new FileManifest();
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.Push, Ancestor(Row("f.txt", 100, T1)),
+                          deleteEnabled: false);
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
     }
 
+    // ── Pull (server authoritative) — the exact mirror of Push ────────────────
+
     [Fact]
-    public void NewFileNotInSnapshot_NormalCopyBehavior()
+    public void Pull_NeverEmitsServerSideActions()
     {
-        var snapshot = MakeManifest(new FileEntry("existing.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
+        var ancestor = Ancestor(Row("keep.txt", 100, T1), Row("gone.txt", 100, T1));
         var client = MakeManifest(
-            new FileEntry("existing.txt", 100, BeforeSync),
-            new FileEntry("brand-new.txt", 50, AfterSync));
-        var server = MakeManifest(new FileEntry("existing.txt", 100, BeforeSync));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
-        var actions = plan.ToDictionary(p => p.RelativePath, p => p.Action);
-        Assert.Equal(SyncActionType.Skip, actions["existing.txt"]);
-        Assert.Equal(SyncActionType.ClientOnly, actions["brand-new.txt"]);
+            new FileEntry("keep.txt", 100, T1),
+            new FileEntry("gone.txt", 100, T1),
+            new FileEntry("client-extra.txt", 100, T2));
+        var server = MakeManifest(
+            new FileEntry("keep.txt", 100, T1),
+            new FileEntry("pull-me.txt", 50, T2));
+
+        var result = Plan(client, server, SyncMode.Pull, ancestor);
+        var actions = Actions(result);
+
+        Assert.Equal(SyncActionType.Skip, actions["keep.txt"]);
+        Assert.Equal(SyncActionType.SendToClient, actions["pull-me.txt"]);
+        Assert.Equal(SyncActionType.DeleteOnClient, actions["gone.txt"]);
+        Assert.Equal(SyncActionType.Skip, actions["client-extra.txt"]);
+
+        Assert.DoesNotContain(result.Entries, p => p.Action == SyncActionType.SendToServer);
+        Assert.DoesNotContain(result.Entries, p => p.Action == SyncActionType.DeleteOnServer);
     }
 
     [Fact]
-    public void TimestampTolerance_WithinTwoSeconds_TreatedAsUntouched()
+    public void Pull_UnknownDeletion_ClientEditedSinceAncestor_Skip()
     {
-        // File mod time is 1 second after lastSync — within ±2s tolerance → treat as untouched → delete
-        var withinTolerance = LastSync.AddSeconds(1);
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
-        var client = new FileManifest(); // deleted on client
-        var server = MakeManifest(new FileEntry("file.txt", 100, withinTolerance));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: true);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
+        // Mirror of Push_UnknownDeletion_ServerEditedSinceAncestor_Skip. This is the branch that
+        // destroys the user's own local files, so it gets its own test rather than relying on
+        // symmetry with the Push case.
+        var client = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var server = new FileManifest();
+        var result = Plan(client, server, SyncMode.Pull, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
     }
 
     [Fact]
-    public void UniDirectional_ServerDeletionsIgnored()
+    public void Pull_UnknownDeletion_ClientUnchanged_DeleteOnClient()
     {
-        // In uni-directional mode, server deletions must not propagate to the client
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
-        var client = MakeManifest(new FileEntry("file.txt", 100, BeforeSync)); // untouched
-        var server = new FileManifest(); // deleted on server
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: false, previousState: state, deleteEnabled: true);
-        // Server deletion ignored in uni mode — no DeleteOnClient, no action at all
-        Assert.Empty(plan);
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = new FileManifest();
+        var result = Plan(client, server, SyncMode.Pull, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.DeleteOnClient, result.Entries[0].Action);
     }
 
     [Fact]
-    public void DeleteEnabled_False_IgnoresDeletions()
+    public void Pull_ClientChangedUnderneath_StillSendToClient()
     {
-        var snapshot = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var state = new RemoteFileSync.State.SyncState(snapshot, LastSync);
-        var client = new FileManifest();
-        var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-        var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, previousState: state, deleteEnabled: false);
-        Assert.Single(plan);
-        Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
-    }
-
-    // ── SyncDatabase-backed deletion detection (new overload) ─────────────────
-
-    private static (SyncDatabase db, string dir) CreateTestDb()
-    {
-        var dir = Path.Combine(Path.GetTempPath(), $"rfs_engine_db_{Guid.NewGuid()}");
-        Directory.CreateDirectory(dir);
-        return (new SyncDatabase(Path.Combine(dir, "sync.db")), dir);
+        var client = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.Pull, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.SendToClient, result.Entries[0].Action);
     }
 
     [Fact]
-    public void Db_DeletedFile_InDb_ProducesDeleteAction()
+    public void Pull_UnknownClientFile_WithoutMirror_Skip()
     {
-        // File in db with status='exists', missing from client, present on server (untouched) → DeleteOnServer
-        var (db, dir) = CreateTestDb();
-        try
-        {
-            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+        var client = MakeManifest(new FileEntry("stray.txt", 100, T1));
+        var server = new FileManifest();
+        var result = Plan(client, server, SyncMode.Pull, ancestor: null, mirrorDeletes: false);
+        Assert.Single(result.Entries);
+        Assert.Equal(SyncActionType.Skip, result.Entries[0].Action);
+    }
 
-            var client = new FileManifest();
-            var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
+    // ── No-ancestor first-run overwrite reporting ────────────────────────────
 
-            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
+    [Fact]
+    public void NoAncestor_ClientNewer_RecordsOverwriteKeepingClient()
+    {
+        // Both sides hold the file on a first run with no ancestor. Newest-wins overwrites the
+        // older server copy in place; the run must report it or the review shows "0 items" for a
+        // sync that just replaced the user's server-side edit. The action itself is unchanged.
+        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
 
-            Assert.Single(plan);
-            Assert.Equal(SyncActionType.DeleteOnServer, plan[0].Action);
-            Assert.Equal("file.txt", plan[0].RelativePath);
-        }
-        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+        Assert.Equal(SyncActionType.SendToServer, Assert.Single(result.Entries).Action);
+
+        var ow = Assert.Single(result.Overwrites);
+        Assert.Equal("f.txt", ow.Path);
+        Assert.True(ow.KeptClientCopy);
+        Assert.Equal(150, ow.KeptSize);
+        Assert.Equal(T2.Ticks, ow.KeptMtimeTicks);
+        Assert.Equal(100, ow.ReplacedSize);
+        Assert.Equal(T1.Ticks, ow.ReplacedMtimeTicks);
     }
 
     [Fact]
-    public void Db_NewFile_NotInDb_ProducesCopyAction()
+    public void NoAncestor_ServerLarger_RecordsOverwriteKeepingServer()
     {
-        // File NOT in db, on client only → ClientOnly (genuinely new)
-        var (db, dir) = CreateTestDb();
-        try
-        {
-            var client = MakeManifest(new FileEntry("brand-new.txt", 50, AfterSync));
-            var server = new FileManifest();
+        // Same mtime, server copy larger, so the size tie-break sends to the client and the
+        // client's copy is the one overwritten. KeptClientCopy must flip so the report names the
+        // right survivor and the right casualty.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 200, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
 
-            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
+        Assert.Equal(SyncActionType.SendToClient, Assert.Single(result.Entries).Action);
 
-            Assert.Single(plan);
-            Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
-            Assert.Equal("brand-new.txt", plan[0].RelativePath);
-        }
-        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+        var ow = Assert.Single(result.Overwrites);
+        Assert.Equal("f.txt", ow.Path);
+        Assert.False(ow.KeptClientCopy);
+        Assert.Equal(200, ow.KeptSize);
+        Assert.Equal(T1.Ticks, ow.KeptMtimeTicks);
+        Assert.Equal(100, ow.ReplacedSize);
+        Assert.Equal(T1.Ticks, ow.ReplacedMtimeTicks);
     }
 
     [Fact]
-    public void Db_PreviouslyDeleted_Reappeared_CopiesAgain()
+    public void NoAncestor_SameContent_RecordsNoOverwrite()
     {
-        // File in db with status='deleted', re-appears on client → ClientOnly
-        var (db, dir) = CreateTestDb();
-        try
-        {
-            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
-            db.MarkDeleted("file.txt", sessionId, null);
-
-            var client = MakeManifest(new FileEntry("file.txt", 100, AfterSync));
-            var server = new FileManifest();
-
-            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
-
-            Assert.Single(plan);
-            Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
-        }
-        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+        // Identical size and mtime resolves to Skip: nothing is replaced, so nothing is reported.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+        Assert.Equal(SyncActionType.Skip, Assert.Single(result.Entries).Action);
+        Assert.Empty(result.Overwrites);
     }
 
     [Fact]
-    public void Db_UniDirectional_ServerLostFile_RePushed()
+    public void NoAncestor_OneSided_RecordsNoOverwrite()
     {
-        // Bug #4 fix: uni mode, db status='exists', server missing, client has → ClientOnly (not silently dropped)
-        var (db, dir) = CreateTestDb();
-        try
-        {
-            long sessionId = db.StartSession("uni", "c:\\local", "server", 5000);
-            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
-
-            var client = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-            var server = new FileManifest(); // server lost the file
-
-            var plan = SyncEngine.ComputePlan(client, server, bidirectional: false, db: db, deleteEnabled: true);
-
-            Assert.Single(plan);
-            Assert.Equal(SyncActionType.ClientOnly, plan[0].Action);
-            Assert.Equal("file.txt", plan[0].RelativePath);
-        }
-        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+        // A file present on only one side is a pure add — there is no loser to overwrite, so the
+        // additive branch must never fabricate an overwrite record.
+        var client = MakeManifest(new FileEntry("c-only.txt", 50, T1));
+        var server = MakeManifest(new FileEntry("s-only.txt", 50, T1));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null);
+        Assert.Empty(result.Overwrites);
     }
 
     [Fact]
-    public void Db_PerFileTimestamp_UsedForDeletion()
+    public void NoAncestor_SkewNormalisesBeforeDecidingOverwrite()
     {
-        // File synced now (LastSynced = UtcNow via MarkSynced), server has a version modified
-        // in the future (T2 > LastSynced), client deleted → SendToClient (restore)
-        var (db, dir) = CreateTestDb();
-        try
-        {
-            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
-
-            // Server file modified after the MarkSynced call (guaranteed future timestamp)
-            var serverModifiedAfterSync = DateTime.UtcNow.AddDays(1);
-
-            var client = new FileManifest(); // deleted on client
-            var server = MakeManifest(new FileEntry("file.txt", 200, serverModifiedAfterSync)); // modified on server after sync
-
-            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
-
-            Assert.Single(plan);
-            Assert.Equal(SyncActionType.SendToClient, plan[0].Action);
-        }
-        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+        // The server clock is +1h; after normalisation the two copies match and resolve to Skip.
+        // Recording an overwrite off the raw mtimes would report a replacement that never happened.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 100, T2.AddHours(1)));
+        var result = Plan(client, server, SyncMode.TwoWay, ancestor: null,
+                          skew: new ClockSkew(TimeSpan.FromHours(1)));
+        Assert.Equal(SyncActionType.Skip, Assert.Single(result.Entries).Action);
+        Assert.Empty(result.Overwrites);
     }
 
     [Fact]
-    public void Db_DeleteEnabled_False_NormalBehavior()
+    public void TwoWayConflict_RecordsNoOverwrite()
     {
-        // deleteEnabled=false, db has data → ignored, normal ServerOnly behavior
-        var (db, dir) = CreateTestDb();
-        try
-        {
-            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
-
-            var client = new FileManifest(); // no file on client
-            var server = MakeManifest(new FileEntry("file.txt", 100, BeforeSync));
-
-            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: false);
-
-            Assert.Single(plan);
-            Assert.Equal(SyncActionType.ServerOnly, plan[0].Action);
-        }
-        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+        // A both-sides-changed conflict keeps both copies; it is not an overwrite. Overwrites are
+        // strictly a no-ancestor, one-copy-wins phenomenon, so the ancestor conflict path must
+        // leave Overwrites empty and route the row through Conflicts instead.
+        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2.AddMinutes(5)));
+        var result = Plan(client, server, SyncMode.TwoWay, Ancestor(Row("f.txt", 100, T1)));
+        Assert.Equal(SyncActionType.ConflictKeepBoth, Assert.Single(result.Entries).Action);
+        Assert.Single(result.Conflicts);
+        Assert.Empty(result.Overwrites);
     }
 
     [Fact]
-    public void Db_BothDeletedFromDb_NoAction()
+    public void Push_DifferingCopies_RecordsNoOverwrite()
     {
-        // File in db status='exists', missing from both manifests → no plan entry
-        var (db, dir) = CreateTestDb();
-        try
-        {
-            long sessionId = db.StartSession("bidi", "c:\\local", "server", 5000);
-            db.MarkSynced("file.txt", 100, BeforeSync, sessionId, "client→server");
+        // Push and Pull are authoritative: the user chose one side to win, so the loser being
+        // overwritten is the documented contract, not a surprise worth a review line. Only the
+        // no-ancestor TwoWay path reports overwrites, so Push must leave the list empty even
+        // though it overwrites the server copy.
+        var client = MakeManifest(new FileEntry("f.txt", 100, T1));
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2));
+        var result = Plan(client, server, SyncMode.Push, ancestor: null);
+        Assert.Equal(SyncActionType.SendToServer, Assert.Single(result.Entries).Action);
+        Assert.Empty(result.Overwrites);
+    }
 
-            var client = new FileManifest(); // not present
-            var server = new FileManifest(); // not present
+    // ── BuildMergedManifest ──────────────────────────────────────────────────
 
-            var plan = SyncEngine.ComputePlan(client, server, bidirectional: true, db: db, deleteEnabled: true);
-
-            Assert.Empty(plan);
-        }
-        finally { db.Dispose(); SqliteConnection.ClearAllPools(); Directory.Delete(dir, true); }
+    [Fact]
+    public void BuildMergedManifest_ConflictKeepBoth_KeepsClientEntry()
+    {
+        // The renamed loser is written into the sync folder and picked up by the next scan; the
+        // merged manifest records the winner so the path is not dropped from tracking entirely.
+        var client = MakeManifest(new FileEntry("f.txt", 150, T2));
+        var server = MakeManifest(new FileEntry("f.txt", 220, T2.AddMinutes(5)));
+        var plan = new List<SyncPlanEntry> { new(SyncActionType.ConflictKeepBoth, "f.txt") };
+        var merged = SyncEngine.BuildMergedManifest(client, server, plan);
+        Assert.Equal(150, merged.Get("f.txt")!.FileSize);
     }
 }

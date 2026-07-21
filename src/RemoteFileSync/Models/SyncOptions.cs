@@ -6,7 +6,14 @@ public sealed class SyncOptions
     public string? Host { get; set; }
     public int Port { get; set; } = 15782;
     public string Folder { get; set; } = string.Empty;
-    public bool Bidirectional { get; set; }
+    public SyncMode Mode { get; set; } = SyncMode.Push;
+
+    /// <summary>
+    /// Compatibility shim for the pre-<see cref="SyncMode"/> callers. Read-only on purpose: a
+    /// settable copy would let it disagree with <see cref="Mode"/>, so a Pull sync could still
+    /// take the bidirectional write-to-server branches.
+    /// </summary>
+    public bool Bidirectional => Mode == SyncMode.TwoWay;
     public bool DeleteEnabled { get; set; }
     public bool JsonProgress { get; set; }
     public string? BackupFolder { get; set; }
@@ -80,6 +87,61 @@ public sealed class SyncOptions
         }
     }
 
+    /// <summary>
+    /// Propagate deletions from the authoritative side even when the ancestor table has no
+    /// evidence the file was ever synced. Off by default: without an ancestor row a missing
+    /// file is indistinguishable from a file that was simply never sent, so mirroring would
+    /// delete work the peer created independently.
+    /// </summary>
+    public bool MirrorDeletes { get; set; }
+
+    /// <summary>Archive destination override. See <see cref="EffectiveArchiveFolder"/>.</summary>
+    public string? ArchiveFolder { get; set; }
+
+    /// <summary>
+    /// Where deleted/overwritten/conflicting files are parked before removal. Defaults to a
+    /// sibling ".rfs-archive-NAME" directory OUTSIDE the sync folder — archiving inside the
+    /// synced tree makes the archived copy re-scan as a new file and propagate back to the
+    /// peer, resurrecting exactly the file that was just deleted.
+    /// Throws when the sync folder has no parent (a drive root or UNC share root); there is
+    /// no safe default in that case and the user must pass --archive-folder explicitly.
+    /// </summary>
+    public string EffectiveArchiveFolder
+    {
+        get
+        {
+            if (ArchiveFolder != null) return ArchiveFolder;
+
+            var full = Path.GetFullPath(Folder).TrimEnd(Path.DirectorySeparatorChar);
+            var parent = Path.GetDirectoryName(full);
+            var name = Path.GetFileName(full);
+
+            // A drive root ("E:\") or UNC share root ("\\server\share") has no parent.
+            // Falling back to the sync folder here would put the archive inside the synced
+            // tree, which resurrects deletions on the next run.
+            if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(name))
+                throw new ArgumentException(
+                    $"--folder '{Folder}' is a drive or share root and has no parent directory, " +
+                    "so there is no safe default archive location. Pass --archive-folder explicitly " +
+                    "(it must be outside the sync folder).");
+
+            return Path.Combine(parent, $".rfs-archive-{name}");
+        }
+    }
+
+    /// <summary>Prune archived sessions older than this many days. 0 = keep forever.</summary>
+    public int ArchiveKeepDays { get; set; } = 30;
+
+    /// <summary>Prune oldest archived sessions once the archive exceeds this size. 0 = no cap.</summary>
+    public long ArchiveMaxBytes { get; set; }
+
+    /// <summary>
+    /// Clock offsets above this are reported rather than silently trusted. Newest-wins
+    /// comparisons are only meaningful within a small skew; a peer an hour ahead would make
+    /// every one of its files look newer and overwrite the whole other side.
+    /// </summary>
+    public const int SuspiciousSkewSeconds = 60;
+
     public void Validate()
     {
         if (string.IsNullOrWhiteSpace(Folder))
@@ -110,6 +172,16 @@ public sealed class SyncOptions
         }
         if (MaxThreads < 1) MaxThreads = 1;
 
+        if (ArchiveKeepDays < 0)
+            throw new ArgumentException(
+                $"--archive-keep-days must be >= 0 (0 = keep forever), got {ArchiveKeepDays}. " +
+                "A negative age makes every archived session look expired and empties the archive " +
+                "on its first prune.");
+        if (ArchiveMaxBytes < 0)
+            throw new ArgumentException(
+                $"--archive-max-size must be >= 0 (0 = no cap), got {ArchiveMaxBytes}. " +
+                "A negative cap is below any real archive size, so every session would be pruned.");
+
         // Backups inside the sync folder are re-scanned as new files and propagated to the
         // peer, growing without bound. Reject that outright rather than discovering it later.
         var syncFull = Path.GetFullPath(Folder);
@@ -119,5 +191,22 @@ public sealed class SyncOptions
             throw new ArgumentException(
                 $"--backup-folder must be outside the sync folder (got '{backupFull}' inside '{syncFull}'). " +
                 "Backups inside the sync folder are re-synced to the peer and grow without bound.");
+
+        // Same containment rule for the archive, but a worse failure than the backup case: an
+        // archived deletion sitting inside the synced tree propagates back to the peer and
+        // recreates the file that was just deleted, so the deletion silently undoes itself on
+        // the next run.
+        var archiveFull = Path.GetFullPath(EffectiveArchiveFolder);
+        // Compare with a trailing separator on BOTH sides. Without it the sync folder itself —
+        // the most destructive value --archive-folder can take — is not a prefix match of
+        // syncFull and slips through.
+        var archiveProbe = archiveFull.EndsWith(Path.DirectorySeparatorChar)
+            ? archiveFull
+            : archiveFull + Path.DirectorySeparatorChar;
+        if (archiveProbe.StartsWith(syncFull, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException(
+                $"--archive-folder must be outside the sync folder (got '{archiveFull}' inside '{syncFull}'). " +
+                "Archived deletions inside the sync folder are re-synced to the peer and resurrect " +
+                "the files that were just deleted.");
     }
 }

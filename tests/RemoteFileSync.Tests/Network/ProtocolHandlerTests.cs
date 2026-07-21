@@ -62,8 +62,15 @@ public class ProtocolHandlerTests
     [Fact]
     public void DeserializeHandshake_RejectsTruncatedPayload()
     {
+        // Reading past the end of a short frame would fabricate a clock reading out of
+        // whatever bytes followed and hand ClockSkew garbage, so the length guard must fire
+        // before any indexing. A v2 peer's 2-byte handshake and 2-byte ack land here too.
         Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshake(new byte[] { 2 }));
+        Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshake(new byte[] { 2, 1 }));
+        Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshake(new byte[10]));
         Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshakeAck(Array.Empty<byte>()));
+        Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshakeAck(new byte[] { 2, 1 }));
+        Assert.Throws<InvalidDataException>(() => ProtocolHandler.DeserializeHandshakeAck(new byte[9]));
     }
 
     [Fact]
@@ -103,28 +110,70 @@ public class ProtocolHandlerTests
     [Fact]
     public void SerializeHandshake_CorrectBytes()
     {
-        var bytes = ProtocolHandler.SerializeHandshake(version: 1, syncMode: 1);
-        Assert.Equal(2, bytes.Length);
-        Assert.Equal(1, bytes[0]);
+        long sent = new DateTime(2026, 7, 20, 10, 0, 0, DateTimeKind.Utc).Ticks;
+        var bytes = ProtocolHandler.SerializeHandshake(version: 3, syncMode: 1, clientSentTicks: sent);
+        Assert.Equal(11, bytes.Length);
+        Assert.Equal(3, bytes[0]);
         Assert.Equal(1, bytes[1]);
+        Assert.Equal(sent, BitConverter.ToInt64(bytes, 2));
+        // The reserved byte is sent, and sent as zero, so both v3 peers agree on the frame
+        // length; a future flag can occupy it without another version bump.
+        Assert.Equal(0, bytes[10]);
     }
 
     [Fact]
     public void DeserializeHandshake_ParsesCorrectly()
     {
-        var bytes = new byte[] { 1, 0 };
-        var (version, syncMode) = ProtocolHandler.DeserializeHandshake(bytes);
-        Assert.Equal(1, version);
+        long sent = new DateTime(2026, 7, 20, 10, 0, 0, DateTimeKind.Utc).Ticks;
+        var bytes = new byte[11];
+        bytes[0] = 3;
+        bytes[1] = 0;
+        BitConverter.TryWriteBytes(bytes.AsSpan(2), sent);
+
+        var (version, syncMode, clientSentTicks) = ProtocolHandler.DeserializeHandshake(bytes);
+
+        Assert.Equal(3, version);
         Assert.Equal(0, syncMode);
+        Assert.Equal(sent, clientSentTicks);
+    }
+
+    [Theory]
+    [InlineData((byte)SyncMode.Push, false, false)]
+    [InlineData((byte)SyncMode.Pull, true, false)]
+    [InlineData((byte)SyncMode.TwoWay, true, true)]
+    [InlineData((byte)SyncMode.TwoWay, false, true)]
+    public void Handshake_SyncMode_RoundTrips(byte mode, bool deleteEnabled, bool mirrorDeletes)
+    {
+        byte packed = (byte)(mode | (deleteEnabled ? 4 : 0) | (mirrorDeletes ? 8 : 0));
+        long sent = new DateTime(2026, 7, 20, 10, 0, 0, DateTimeKind.Utc).Ticks;
+
+        var data = ProtocolHandler.SerializeHandshake(3, packed, sent);
+        var (version, syncMode, clientSentTicks) = ProtocolHandler.DeserializeHandshake(data);
+
+        Assert.Equal(3, version);
+        Assert.Equal(sent, clientSentTicks);
+        Assert.Equal((SyncMode)mode, (SyncMode)(syncMode & 0b11));
+        Assert.Equal(deleteEnabled, (syncMode & 4) != 0);
+        Assert.Equal(mirrorDeletes, (syncMode & 8) != 0);
     }
 
     [Fact]
-    public void Handshake_SyncMode_RoundTrips()
+    public void HandshakeAck_RoundTripsServerTicks()
     {
-        var data = ProtocolHandler.SerializeHandshake(1, 3);
-        var (version, syncMode) = ProtocolHandler.DeserializeHandshake(data);
-        Assert.Equal(1, version);
-        Assert.Equal(3, syncMode);
+        long serverTicks = new DateTime(2026, 7, 20, 10, 0, 5, DateTimeKind.Utc).Ticks;
+        var data = ProtocolHandler.SerializeHandshakeAck(3, accepted: true, serverTicks);
+        Assert.Equal(10, data.Length);
+
+        var (version, accepted, ticks) = ProtocolHandler.DeserializeHandshakeAck(data);
+        Assert.Equal(3, version);
+        Assert.True(accepted);
+        Assert.Equal(serverTicks, ticks);
+
+        // Byte 1 keeps v2's polarity (0 == accepted) so a rejection is still legible to a
+        // peer that only reads the first two bytes.
+        var rejected = ProtocolHandler.SerializeHandshakeAck(3, accepted: false, serverTicks);
+        Assert.Equal(1, rejected[1]);
+        Assert.False(ProtocolHandler.DeserializeHandshakeAck(rejected).accepted);
     }
 
     [Fact]

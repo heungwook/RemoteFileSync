@@ -163,4 +163,131 @@ public class CliParserTests
         var opts = Program.ParseArgs(args);
         Assert.False(opts.DeleteEnabled);
     }
+
+    [Theory]
+    [InlineData("push", SyncMode.Push)]
+    [InlineData("PUSH", SyncMode.Push)]
+    [InlineData("pull", SyncMode.Pull)]
+    [InlineData("Pull", SyncMode.Pull)]
+    [InlineData("two-way", SyncMode.TwoWay)]
+    [InlineData("TWO-WAY", SyncMode.TwoWay)]
+    public void ParseArgs_ModeFlag_IsCaseInsensitive(string value, SyncMode expected)
+    {
+        var opts = Program.ParseArgs(new[] { "client", "--host", "h", "--folder", ".", "--mode", value });
+        Assert.Equal(expected, opts.Mode);
+    }
+
+    [Theory]
+    [InlineData("bidi")]
+    [InlineData("twoway")]
+    [InlineData("mirror")]
+    [InlineData("")]
+    public void ParseArgs_UnknownMode_ThrowsArgumentException(string value)
+    {
+        // Silently falling back to the Push default would send the user's files in the
+        // opposite direction from the one they typed.
+        var ex = Assert.Throws<ArgumentException>(
+            () => Program.ParseArgs(new[] { "client", "--host", "h", "--folder", ".", "--mode", value }));
+        Assert.Contains("--mode", ex.Message);
+    }
+
+    [Fact]
+    public void ParseArgs_NoModeFlag_DefaultsToPush()
+    {
+        var opts = Program.ParseArgs(new[] { "client", "--host", "h", "--folder", "." });
+        Assert.Equal(SyncMode.Push, opts.Mode);
+        Assert.False(opts.Bidirectional);
+    }
+
+    [Theory]
+    [InlineData("--bidirectional")]
+    [InlineData("-b")]
+    public void ParseArgs_BidirectionalAlias_SetsTwoWayMode(string flag)
+    {
+        // Deprecated but still accepted: existing scripts and ExecRFS profiles emit it.
+        var opts = Program.ParseArgs(new[] { "client", "--host", "h", "--folder", ".", flag });
+        Assert.Equal(SyncMode.TwoWay, opts.Mode);
+        Assert.True(opts.Bidirectional);
+    }
+
+    [Fact]
+    public void ParseArgs_MirrorFlag_SetsMirrorDeletes()
+    {
+        var opts = Program.ParseArgs(new[] { "client", "--host", "h", "--folder", ".", "--mirror" });
+        Assert.True(opts.MirrorDeletes);
+    }
+
+    [Fact]
+    public void ParseArgs_NoMirrorFlag_DefaultsFalse()
+    {
+        var opts = Program.ParseArgs(new[] { "client", "--host", "h", "--folder", "." });
+        Assert.False(opts.MirrorDeletes);
+    }
+
+    [Fact]
+    public void ParseArgs_ArchiveFolderAndRetentionFlags()
+    {
+        var args = new[]
+        {
+            "client", "--host", "h", "--folder", ".",
+            "--archive-folder", @"C:\Archive",
+            "--archive-keep-days", "7",
+            "--archive-max-size", "512M"
+        };
+        var opts = Program.ParseArgs(args);
+
+        Assert.Equal(@"C:\Archive", opts.ArchiveFolder);
+        Assert.Equal(7, opts.ArchiveKeepDays);
+        Assert.Equal(512L * 1024 * 1024, opts.ArchiveMaxBytes);
+    }
+
+    [Theory]
+    [InlineData("0", 0L)]
+    [InlineData("1024", 1024L)]
+    [InlineData("4k", 4L * 1024)]
+    [InlineData("4K", 4L * 1024)]
+    [InlineData("4KB", 4L * 1024)]
+    [InlineData("20m", 20L * 1024 * 1024)]
+    [InlineData("20MB", 20L * 1024 * 1024)]
+    [InlineData("2G", 2L * 1024 * 1024 * 1024)]
+    [InlineData("2gb", 2L * 1024 * 1024 * 1024)]
+    public void ParseArgs_ArchiveMaxSize_AcceptsSuffixes(string value, long expected)
+    {
+        var opts = Program.ParseArgs(
+            new[] { "client", "--host", "h", "--folder", ".", "--archive-max-size", value });
+        Assert.Equal(expected, opts.ArchiveMaxBytes);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("M")]
+    [InlineData("MB")]
+    [InlineData("abc")]
+    [InlineData("1.5G")]
+    [InlineData("10T")]
+    [InlineData("-1M")]
+    [InlineData("9999999999999999999G")]
+    public void ParseArgs_ArchiveMaxSize_RejectsGarbage(string value)
+    {
+        // A silently-zero cap reads as "no cap" and lets the archive grow until the disk fills.
+        var ex = Assert.Throws<ArgumentException>(
+            () => Program.ParseArgs(new[] { "client", "--host", "h", "--folder", ".", "--archive-max-size", value }));
+        Assert.Contains("--archive-max-size", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("--mode")]
+    [InlineData("--archive-folder")]
+    [InlineData("--archive-keep-days")]
+    [InlineData("--archive-max-size")]
+    public void ParseArgs_MissingValueAfterNewFlag_ThrowsArgumentException(string flag)
+    {
+        // Asserting the MESSAGE, not just the type: an unrecognised flag also throws
+        // ArgumentException (from the default: arm), so a bare Assert.Throws would pass even
+        // if the flag were never wired up, and would keep passing for a flag that read
+        // args[++i] directly instead of going through NextValue.
+        var ex = Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "client", flag }));
+        Assert.Contains("Missing value for", ex.Message);
+        Assert.Contains(flag, ex.Message);
+    }
 }

@@ -1,8 +1,10 @@
 ﻿using System.Net;
 using System.Net.Sockets;
+using RemoteFileSync.Backup;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
 using RemoteFileSync.Network;
+using static RemoteFileSync.Tests.Integration.ArchiveAssertions;
 
 namespace RemoteFileSync.Tests.Integration;
 
@@ -49,7 +51,7 @@ public class EndToEndTests : IDisposable
 
         int port = GetFreePort();
         var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
-        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = false };
+        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Mode = SyncMode.Push };
 
         using var serverLogger = new SyncLogger(false, null);
         using var clientLogger = new SyncLogger(false, null);
@@ -83,7 +85,7 @@ public class EndToEndTests : IDisposable
 
         int port = GetFreePort();
         var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
-        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = true };
+        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Mode = SyncMode.TwoWay };
 
         using var serverLogger = new SyncLogger(false, null);
         using var clientLogger = new SyncLogger(false, null);
@@ -105,13 +107,12 @@ public class EndToEndTests : IDisposable
         Assert.True(File.Exists(Path.Combine(_clientDir, "server-only.txt")));
         Assert.Equal("only on server", File.ReadAllText(Path.Combine(_clientDir, "server-only.txt")));
 
-        // Server's old shared.txt should be backed up — beside the sync folder, not inside it.
-        var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
-        var backupPath = Path.Combine(_testRoot, ".rfs-backups-server", dateStr, "shared.txt");
-        Assert.True(File.Exists(backupPath), $"expected backup at {backupPath}");
-        Assert.Equal("server older", File.ReadAllText(backupPath));
-        // And nothing may have been written inside the sync folder itself.
-        Assert.False(Directory.Exists(Path.Combine(_serverDir, dateStr)));
+        // Server's old shared.txt must be archived before it is overwritten — beside the sync
+        // folder, not inside it, or the archived copy is re-scanned as a new file next run.
+        var archived = AssertArchived(Path.Combine(_testRoot, ".rfs-archive-server"),
+            ArchiveReason.Overwritten, "shared.txt");
+        Assert.Equal("server older", File.ReadAllText(archived));
+        Assert.Empty(Directory.GetDirectories(_serverDir));
     }
 
     [Fact]
@@ -123,7 +124,7 @@ public class EndToEndTests : IDisposable
 
         int port = GetFreePort();
         var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
-        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Bidirectional = true };
+        var clientOpts = new SyncOptions { IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir, Mode = SyncMode.TwoWay };
 
         using var serverLogger = new SyncLogger(false, null);
         using var clientLogger = new SyncLogger(false, null);
@@ -139,23 +140,26 @@ public class EndToEndTests : IDisposable
 
         Assert.Equal(0, clientResult);
         Assert.Equal(0, serverResult);
-        var dateStr = DateTime.UtcNow.ToString("yyyyMMdd");
-        Assert.False(Directory.Exists(Path.Combine(_serverDir, dateStr)));
-        Assert.False(Directory.Exists(Path.Combine(_clientDir, dateStr)));
+        // Nothing was replaced, so nothing may be archived, and no session folder may appear
+        // inside either sync folder.
+        AssertNothingArchived(Path.Combine(_testRoot, ".rfs-archive-server"));
+        AssertNothingArchived(Path.Combine(_testRoot, ".rfs-archive-client"));
+        Assert.Empty(Directory.GetDirectories(_serverDir));
+        Assert.Empty(Directory.GetDirectories(_clientDir));
     }
 
     /// <summary>
     /// Runs one full client/server sync against the shared test folders.
     /// Uses Once=true so the server returns after the sync instead of looping.
     /// </summary>
-    private async Task<(int client, int server)> RunSyncAsync(bool bidirectional)
+    private async Task<(int client, int server)> RunSyncAsync(SyncMode mode)
     {
         int port = GetFreePort();
         var serverOpts = new SyncOptions { IsServer = true, Once = true, Port = port, Folder = _serverDir };
         var clientOpts = new SyncOptions
         {
             IsServer = false, Host = "127.0.0.1", Port = port,
-            Folder = _clientDir, Bidirectional = bidirectional
+            Folder = _clientDir, Mode = mode
         };
 
         using var serverLogger = new SyncLogger(false, null);
@@ -178,7 +182,7 @@ public class EndToEndTests : IDisposable
         var ts = new DateTime(2026, 3, 20, 9, 30, 0, DateTimeKind.Utc);
         CreateFileWithTimestamp(_clientDir, "stamped.txt", "payload", ts);
 
-        await RunSyncAsync(bidirectional: false);
+        await RunSyncAsync(SyncMode.Push);
 
         var dest = Path.Combine(_serverDir, "stamped.txt");
         Assert.True(File.Exists(dest));
@@ -198,7 +202,7 @@ public class EndToEndTests : IDisposable
         CreateFileWithTimestamp(_clientDir, "a.txt", "alpha", ts);
         CreateFileWithTimestamp(_clientDir, Path.Combine("sub", "b.txt"), "bravo", ts);
 
-        var first = await RunSyncAsync(bidirectional: true);
+        var first = await RunSyncAsync(SyncMode.TwoWay);
         Assert.Equal(0, first.client);
 
         // Capture what the server holds after the first sync.
@@ -206,7 +210,7 @@ public class EndToEndTests : IDisposable
             .ToDictionary(p => p, p => File.GetLastWriteTimeUtc(p));
         Assert.Equal(2, afterFirst.Count);
 
-        var second = await RunSyncAsync(bidirectional: true);
+        var second = await RunSyncAsync(SyncMode.TwoWay);
         Assert.Equal(0, second.client);
 
         // Nothing may be rewritten: identical file set, identical timestamps.
@@ -227,13 +231,13 @@ public class EndToEndTests : IDisposable
         CreateFileWithTimestamp(_clientDir, "shared.txt", "content",
             new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc));
 
-        await RunSyncAsync(bidirectional: true);
+        await RunSyncAsync(SyncMode.TwoWay);
         var clientStamp = File.GetLastWriteTimeUtc(Path.Combine(_clientDir, "shared.txt"));
         var serverStamp = File.GetLastWriteTimeUtc(Path.Combine(_serverDir, "shared.txt"));
         Assert.Equal(clientStamp, serverStamp);
 
-        await RunSyncAsync(bidirectional: true);
-        await RunSyncAsync(bidirectional: true);
+        await RunSyncAsync(SyncMode.TwoWay);
+        await RunSyncAsync(SyncMode.TwoWay);
 
         // Both sides must still agree, and neither may have been rewritten.
         Assert.Equal(clientStamp, File.GetLastWriteTimeUtc(Path.Combine(_clientDir, "shared.txt")));
