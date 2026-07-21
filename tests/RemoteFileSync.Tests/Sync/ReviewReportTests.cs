@@ -122,21 +122,30 @@ public sealed class ReviewReportTests : IDisposable
     }
 
     [Fact]
-    public void BuildLines_Overwrite_ClientKept_ShowsServerReplacedOnTheServer()
+    public void BuildLines_Overwrite_ClientKept_ServerCopyReplaced_NeverPrintsAFakeLocalPath()
     {
-        // The client copy won newest-wins, so the SERVER copy is the loser and was archived on
-        // the server — the client cannot name that path, so the convention is printed, never a
-        // wrong local path (team-lead's instruction: a wrong path is worse than a folder).
+        // The client copy won newest-wins, so the SERVER copy is the loser and was archived on the
+        // server under ITS OWN --archive-folder. This is the rule that must never break: even when
+        // a local client archive root IS available, it must NOT be spliced into the path, because
+        // the server may archive somewhere else entirely — a client-looking path here would be a
+        // lie. So the report states the copy is on the server and names only the convention.
+        var localArchiveRoot = Path.Combine(_tempDir, ".rfs-archive-client", "20260720-120000");
+
         var text = string.Join("\n", ReviewReport.BuildLines(
             Array.Empty<ConflictEntry>(), Array.Empty<ConflictEntry>(),
-            new[] { OverwriteClientKept("data/big.bin") }));
+            new[] { OverwriteClientKept("data/big.bin") },
+            archiveSessionRoot: localArchiveRoot));
 
         Assert.Contains("[FIRST-RUN OVERWRITE] data/big.bin", text);
         Assert.Contains("client: 5000 bytes  2026-07-20 08:00:00Z", text);
         Assert.Contains("server: 4000 bytes  2026-07-20 07:30:00Z", text);
         Assert.Contains("kept: client copy", text);
         Assert.Contains("replaced: server copy", text);
+        // "on the server" is explicit so the user does not go hunting locally.
+        Assert.Contains("on the server", text);
         Assert.Contains("overwritten/data/big.bin", text);
+        // The pin: the local archive root MUST NOT appear anywhere for a server-side loser.
+        Assert.DoesNotContain(localArchiveRoot, text);
     }
 
     [Fact]

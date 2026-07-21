@@ -151,20 +151,24 @@ public static class ReviewReport
     /// <summary>
     /// Where the overwritten loser can be found. Only the client's own overwritten copy is
     /// archived locally (by the receive loop's pre-overwrite hook) at a path this side can name;
-    /// when the client copy won, the loser is the SERVER's copy, archived on the server, so the
-    /// convention is printed rather than a path this side cannot know — a wrong exact path would
-    /// be worse than naming the folder.
+    /// when the client copy won, the loser is the SERVER's copy, archived on the SERVER under its
+    /// own (possibly different) --archive-folder. This side cannot know that path, so it MUST NOT
+    /// construct one from the local archive root — that would be a lie. It states the copy is on
+    /// the server and names only the reason-folder convention, hence archiveSessionRoot is
+    /// deliberately ignored on this branch.
     /// </summary>
     private static string ReplacedLine(OverwriteInfo ow, string? archiveSessionRoot)
     {
         if (ow.KeptClientCopy)
-            return $"server copy (archived on the server under {OverwrittenReasonFolder}/{ow.Path})";
+            return $"server copy — on the server, under {OverwrittenReasonFolder}/{ow.Path} " +
+                   "(exact location known only to the server)";
 
         if (archiveSessionRoot == null)
             return $"client copy (archived locally under {OverwrittenReasonFolder}/{ow.Path})";
 
         // Same layout ArchiveManager writes: <SessionRoot>/overwritten/<relative path>. One
-        // overwrite per path per session, so there is no _N collision suffix to account for here.
+        // overwrite per path per session, so there is no _N collision suffix to account for here;
+        // the file name is provable, so the exact local path is printed rather than the folder.
         var archived = Path.Combine(archiveSessionRoot, OverwrittenReasonFolder,
             ow.Path.Replace('/', Path.DirectorySeparatorChar));
         return $"client copy archived at {archived}";
