@@ -295,10 +295,14 @@ public static class SyncEngine
                     if (serverEntry != null) merged.Add(serverEntry);
                     break;
                 case SyncActionType.ConflictKeepBoth:
-                    // Both copies survive; the loser is renamed and reappears on the next scan.
-                    // Record the client copy under the original name so the path is not dropped
-                    // from tracking entirely — an untracked path is planned from scratch next
-                    // run, which is how a resolved conflict turns back into a conflict.
+                    // Not reachable from this method's only caller: BuildMergedManifest runs
+                    // solely on SyncClient's `_db == null` fallback, where ComputePlan routes
+                    // TwoWay through PlanNoAncestor — which never emits ConflictKeepBoth — and
+                    // Push/Pull never emit it either. Kept as a defensive no-op (and to pin the
+                    // direct unit test below) rather than deleted, since a lookup here would
+                    // return null anyway: a surviving ConflictKeepBoth entry's RelativePath is
+                    // already the CONFLICT name after ConflictKeepBothExecutor.Expand, not the
+                    // original path this switch is keyed on.
                     var conflictEntry = clientManifest.Get(entry.RelativePath);
                     if (conflictEntry != null) merged.Add(conflictEntry);
                     break;

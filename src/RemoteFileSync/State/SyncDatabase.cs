@@ -128,6 +128,13 @@ PRAGMA cache_size = -2000;";
         using var txn = _conn.BeginTransaction();
         try
         {
+            // WARNING for the next schema bump: the else branch assumes any non-v1 existing
+            // table already matches SchemaVersion, because CreateFilesV2's `CREATE TABLE IF NOT
+            // EXISTS` is a no-op against a table that already exists, followed by an
+            // unconditional user_version stamp. A future v3 must not reuse this shape as-is —
+            // it needs its own explicit source-version detection and migration branch (like
+            // MigrateV1ToV2), or it will silently stamp the new version onto a table nothing
+            // actually migrated.
             if (isV1) MigrateV1ToV2(txn);
             else      CreateFilesV2(txn);
 
@@ -302,6 +309,11 @@ WHERE id = $id;";
         cmd.ExecuteNonQuery();
     }
 
+    // Unlike the ancestor path below (IsRepresentableTicks) and ReviewReport.TryUtc, the tick
+    // columns read here are trusted unguarded. That is a decision, not an oversight: this
+    // history is written and read by this same class from its own sessions, never fed from an
+    // externally-corrupted source in the current call graph, so adding a guard would be
+    // defending against input that cannot occur — YAGNI, not a gap.
     public IEnumerable<SyncSessionEntry> GetRecentSessions(int limit = 20)
     {
         using var cmd = _conn.CreateCommand();
@@ -564,12 +576,12 @@ WHERE status = 'deleted' AND deleted_utc IS NOT NULL AND deleted_utc < $cutoff;"
 
     /// <summary>
     /// Legacy one-sided upsert: v1 stored a single size+mtime, so both v2 sides receive it.
-    /// SAFE only when the caller genuinely knows both sides hold that value — which is true
-    /// for <see cref="MigrateFromBinary"/> and false for SyncClient's Skip loop, where the
-    /// value comes from whichever side happened to have the file. Phase 6 owns
-    /// SyncClient.cs:185-206 and must split that call into a both-sides-present
-    /// <see cref="UpsertSynced"/> and a <see cref="MarkSkipped"/>; until then a Push or Pull
-    /// run can fabricate a peer state that never existed and delete on the next pass.
+    /// SAFE only where the caller genuinely knows both sides hold that value — which today
+    /// means <see cref="MigrateFromBinary"/> and SyncClient's post-transfer recording, once a
+    /// file has actually landed on both peers. SyncClient's Skip loop no longer calls this: it
+    /// was split into a both-sides-present <see cref="UpsertSynced"/> and a one-sided
+    /// <see cref="MarkSkipped"/>, so a Push or Pull run can no longer fabricate a peer state
+    /// that never existed from a skip alone.
     /// </summary>
     public void MarkSynced(string path, long fileSize, DateTime lastModified, long sessionId, string direction)
     {
@@ -690,6 +702,10 @@ VALUES ($path, $action, NULL, NULL, $session, NULL, $detail, $ts);";
     public IReadOnlyList<ConflictEntry> GetSessionResurrections(long sessionId) =>
         GetSessionEntries(sessionId, "resurrected");
 
+    // Backs GetSessionConflicts/GetSessionResurrections. Its Timestamp column, like
+    // GetRecentSessions' above, is read unguarded on purpose: these rows are this session's own
+    // just-written file_versions entries, not externally-corrupted input, so there is nothing
+    // for an IsRepresentableTicks-style guard to defend against here.
     private IReadOnlyList<ConflictEntry> GetSessionEntries(long sessionId, string action)
     {
         using var cmd = _conn.CreateCommand();
@@ -716,6 +732,9 @@ ORDER BY timestamp ASC, id ASC;";
 
     // ── History ───────────────────────────────────────────────────────────────
 
+    // Same asymmetry with the ancestor path as GetRecentSessions/GetSessionEntries above: the
+    // LastModified/Timestamp columns are read unguarded because this reader has no production
+    // caller fed from externally-corrupted ticks today, not because the guard was forgotten.
     public IEnumerable<FileVersionEntry> GetFileHistory(string path, int limit = 50)
     {
         using var cmd = _conn.CreateCommand();

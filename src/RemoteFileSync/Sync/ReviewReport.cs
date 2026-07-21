@@ -20,7 +20,9 @@ public static class ReviewReport
     private const string ResurrectionNote = "kept: modified after the peer deleted it";
 
     // The wire value of ProgressEvent.Kind. Deliberately not the same strings as the log tags:
-    // the log is for humans, these are parsed by ExecRFS.
+    // the log is for humans, these are emitted for GUI/ExecRFS consumption. No GUI
+    // HandleProgress switch has a "review" case yet, so nothing parses them today — this is
+    // the contract the review UI is meant to consume once it exists.
     private const string ConflictKind     = "conflict";
     private const string ResurrectionKind = "resurrection";
     private const string OverwriteKind    = "overwrite";

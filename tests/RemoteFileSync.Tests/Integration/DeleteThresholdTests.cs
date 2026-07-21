@@ -127,4 +127,80 @@ public class DeleteThresholdTests : IDisposable
         // the floor, or users learn to pass --force-delete by reflex.
         Assert.True(SyncOptions.MinTrackedFilesForDeleteGuard > 2);
     }
+
+    /// <summary>
+    /// Tracked files seeded on the SERVER side (mirror of <see cref="SeedTrackedFiles"/>, which
+    /// seeds the client): both ancestor columns come from the same on-disk scan, so the row
+    /// asserts "both sides held this file, unchanged" without lying about either.
+    /// </summary>
+    private SyncDatabase SeedTrackedFilesOnServer(int count)
+    {
+        var db = new SyncDatabase(Path.Combine(_stateDir, "state.db"));
+        var session = db.StartSession("two-way+delete", _clientDir, "127.0.0.1", 1234);
+        for (int i = 0; i < count; i++)
+        {
+            var name = $"file{i:D3}.txt";
+            var full = Path.Combine(_serverDir, name);
+            File.WriteAllText(full, $"content {i}");
+            var fi = new FileInfo(full);
+            db.UpsertSynced(name, fi.Length, fi.LastWriteTimeUtc.Ticks,
+                                  fi.Length, fi.LastWriteTimeUtc.Ticks, session, "to_client");
+        }
+        db.CompleteSession(session, count, 0, 0, 0);
+        return db;
+    }
+
+    /// <summary>
+    /// F6: an asymmetric --force-delete run (client forced, server not) with a delete-only plan.
+    /// The client's own budget check is skipped because it is forced, so it sends a plan the
+    /// SERVER's un-forced budget guard rejects; the server return-4s and closes its socket
+    /// before the client's Phase-B DeleteFile write. Phase A's upload loop already turns a
+    /// mid-transfer peer disconnect into a clean exit; this pins that Phase B (the client-issued
+    /// delete write) and the closing SyncComplete exchange get the same handling instead of an
+    /// unhandled throw.
+    /// </summary>
+    [Fact]
+    public async Task AsymmetricForceDelete_ServerBudgetAborts_ClientExitsCleanlyNotCrash()
+    {
+        // 20 files on the server, tracked as an ancestor row on the client's own DB but absent
+        // from the client's folder — the client "deleted" them, so TwoWay plans DeleteOnServer
+        // for all 20: a delete-only plan, well past both MinTrackedFilesForDeleteGuard and
+        // --max-delete-percent, with nothing for Phase A to upload.
+        using var db = SeedTrackedFilesOnServer(20);
+
+        int port = GetFreePort();
+        var serverOpts = new SyncOptions
+        {
+            IsServer = true, Once = true, Port = port, Folder = _serverDir, ForceDelete = false,
+        };
+        var clientOpts = new SyncOptions
+        {
+            IsServer = false, Host = "127.0.0.1", Port = port, Folder = _clientDir,
+            Mode = SyncMode.TwoWay, DeleteEnabled = true, ForceDelete = true,
+        };
+
+        using var serverLogger = new SyncLogger(false, null, suppressConsole: true);
+        using var clientLogger = new SyncLogger(false, null, suppressConsole: true);
+        var server = new SyncServer(serverOpts, serverLogger);
+        var client = new SyncClient(clientOpts, clientLogger, db: db);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var serverTask = server.RunAsync(cts.Token);
+        await Task.Delay(300);
+
+        int exit = -1;
+        var ex = await Record.ExceptionAsync(async () => exit = await client.RunAsync(cts.Token));
+
+        Assert.Null(ex);   // the point of the fix: no unhandled exception out of RunAsync
+        // 3 is the same peer-disconnect exit Phase A's upload loop already returns for a
+        // mid-transfer disconnect (SyncClient.cs's "desynced" checks) — Phase B and the closing
+        // SyncComplete exchange now share that handling rather than crashing.
+        Assert.Equal(3, exit);
+
+        try { await serverTask; } catch { /* the server's own guard return-4s; expected */ }
+
+        // No data loss either way: the server aborted before deleting anything, and the client
+        // never applies a deletion in this direction to begin with.
+        Assert.Equal(20, Directory.GetFiles(_serverDir).Length);
+    }
 }

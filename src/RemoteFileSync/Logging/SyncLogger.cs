@@ -6,6 +6,7 @@ public sealed class SyncLogger : IDisposable
     private readonly bool _suppressConsole;
     private readonly StreamWriter? _logWriter;
     private readonly object _lock = new();
+    private bool _disposed;
 
     public SyncLogger(bool verbose, string? logFile, bool suppressConsole = false)
     {
@@ -51,13 +52,23 @@ public sealed class SyncLogger : IDisposable
         {
             if (!_suppressConsole && (consoleAlways || _verbose))
                 Console.WriteLine(consoleLine);
-            _logWriter?.WriteLine(fileLine);
+            // _logWriter is readonly and cannot be nulled on Dispose, so a call arriving after
+            // Dispose (e.g. the Ctrl+C handler's shutdown Warning) must be told to skip the
+            // write itself, or it throws ObjectDisposedException on the now-disposed writer.
+            if (!_disposed) _logWriter?.WriteLine(fileLine);
         }
     }
 
     public void Dispose()
     {
-        _logWriter?.Flush();
-        _logWriter?.Dispose();
+        lock (_lock)
+        {
+            // Idempotent, and locked against a Log() call in flight: without the lock, Dispose
+            // could flush+dispose the writer between Log()'s null-check and its WriteLine.
+            if (_disposed) return;
+            _disposed = true;
+            _logWriter?.Flush();
+            _logWriter?.Dispose();
+        }
     }
 }

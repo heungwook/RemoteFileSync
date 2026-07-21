@@ -63,7 +63,7 @@ RemoteFileSync.exe client --host 10.0.1.50 --folder "C:\Local" --mode two-way
 | `--delete` | `-d` | off | Propagate deletions (opt-in) |
 | `--max-delete-percent <n>` | — | `25` | Abort if deletions exceed this share of tracked files |
 | `--force-delete` | — | off | Bypass the deletion threshold |
-| `--backup-folder <path>` | — | `.rfs-backups-NAME` beside the sync folder | Legacy backup location, kept for existing scripts. **Must be outside the sync folder** |
+| `--backup-folder <path>` | — | `.rfs-backups-NAME` beside the sync folder | Accepted for CLI compatibility only — nothing is written there. Replaced, deleted and conflicted files go to `--archive-folder` instead. **Must be outside the sync folder** |
 | `--archive-folder <path>` | — | `.rfs-archive-NAME` beside the sync folder | Where replaced, deleted and conflicted files are kept. **Must be outside the sync folder** |
 | `--archive-keep-days <n>` | — | `30` | Prune archive sessions older than this. `0` keeps them forever |
 | `--archive-max-size <n>` | — | `0` (off) | Cap the total archive size; accepts `K`/`M`/`G` suffixes. Oldest sessions are pruned first |
@@ -104,9 +104,10 @@ the peer.
 Several guards exist because sync bugs destroy data rather than merely misbehaving:
 
 - **Deletion threshold.** With `--delete`, the sync aborts (exit `4`) if deletions would exceed
-  `--max-delete-percent` of tracked files. This catches the common disaster of pointing
-  `--folder` at the wrong or an empty directory. It applies only once at least 10 files are
-  tracked, since a percentage is meaningless on tiny sets. Override with `--force-delete`.
+  `--max-delete-percent` of the files on the side being deleted from. This catches the common
+  disaster of pointing `--folder` at the wrong or an empty directory. It applies only once at
+  least 10 files exist on the side being deleted from, since a percentage is meaningless on tiny
+  sets. Override with `--force-delete`.
 - **Incomplete scans never delete.** If any directory could not be read, deletion propagation is
   refused — an unreadable file is indistinguishable from a deleted one.
 - **Atomic receives.** Incoming files are staged beside their destination, checksum-verified,
@@ -140,9 +141,15 @@ Several guards exist because sync bugs destroy data rather than merely misbehavi
 
 ## How two-way sync decides
 
-Two-way sync keeps an **ancestor table**: for every path, the size and modification time each
-side had at the end of the last successful sync. Comparing the two current states against that
-common ancestor separates four cases a straight two-way comparison cannot:
+Everything below requires `--delete` alongside `--mode two-way`. Without `--delete`, no ancestor
+table is built at all, so two-way sync falls back to plain newest-wins for every path — there is
+no edit-vs-delete discrimination, and a file deleted on one side is simply re-copied
+(resurrected) from the other rather than tombstoned.
+
+With `--delete`, two-way sync keeps an **ancestor table**: for every path, the size and
+modification time each side had at the end of the last successful sync. Comparing the two
+current states against that common ancestor separates four cases a straight two-way comparison
+cannot:
 
 | Since the last sync | Result |
 |---|---|

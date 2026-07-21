@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using Microsoft.Data.Sqlite;
 using RemoteFileSync.Logging;
 using RemoteFileSync.Models;
 using RemoteFileSync.Network;
@@ -121,6 +122,69 @@ public class SyncClientGateTests : IDisposable
         Assert.Equal(2, await client.RunAsync(CancellationToken.None));
         // Program no longer opens the database; the client does, after the gate has passed.
         Assert.True(File.Exists(_dbPath));
+    }
+
+    /// <summary>
+    /// The header-only probe in <see cref="SyncClient.PairStateLost"/> proves the file opens as
+    /// SQLite; it does not prove the `files` (ancestor) table inside it survived intact. A DB
+    /// whose header and user_version are fine but whose `files` table was dropped or corrupted
+    /// passes that probe, so the gate does not fire, and execution reaches `_db.LoadAll()` —
+    /// which throws. Pre-fix that exception escaped to Program.cs as a generic "Fatal error"
+    /// (exit 3); this pins the fix: the same marker-present "state lost" contract as the header
+    /// gate, exit 4, before anything is deleted.
+    /// </summary>
+    [Fact]
+    public async Task CorruptAncestorTable_WithMarker_AbortsWithExitFourNotThree()
+    {
+        // A real database, so the header and user_version are genuinely valid — then the one
+        // table LoadAll reads from is dropped out from underneath it, leaving everything the
+        // magic-header probe checks intact.
+        using (var db = new SyncDatabase(_dbPath)) { }
+        using (var raw = new SqliteConnection($"Data Source={_dbPath}"))
+        {
+            raw.Open();
+            using var cmd = raw.CreateCommand();
+            cmd.CommandText = "DROP TABLE files;";
+            cmd.ExecuteNonQuery();
+        }
+        PairMarker.Write(_dbPath);
+
+        // Proves the premise: the probe alone does not catch this case, so the fix has to live
+        // past it, at the LoadAll call.
+        Assert.False(SyncClient.PairStateLost(_dbPath));
+
+        // A false-negative in the fix (no abort, plan computed and executed) would delete this.
+        File.WriteAllText(Path.Combine(_folder, "local.txt"), "must survive");
+
+        // A real peer: this gate fires only after the handshake and manifest exchange, so a
+        // closed port (as the other gate tests use, to prove they run BEFORE connecting) would
+        // never reach it.
+        int port = ClosedPort();
+        var peerFolder = Path.Combine(_root, "peer");
+        Directory.CreateDirectory(peerFolder);
+        var serverOpts = new SyncOptions
+        {
+            IsServer = true, Once = true, BindAddress = "127.0.0.1", Port = port, Folder = peerFolder,
+        };
+        using var serverLogger = new SyncLogger(false, null, suppressConsole: true);
+        var server = new SyncServer(serverOpts, serverLogger);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var serverTask = server.RunAsync(cts.Token);
+
+        using var logger = new SyncLogger(false, null, suppressConsole: true);
+        var clientOpts = ClientOptions();
+        clientOpts.Port = port;
+        var client = new SyncClient(clientOpts, logger, dbPath: _dbPath);
+
+        var exit = await client.RunAsync(cts.Token);
+
+        Assert.Equal(4, exit);
+        Assert.True(File.Exists(Path.Combine(_folder, "local.txt")),
+            "a local file was touched even though the run should have aborted before planning.");
+
+        // The client aborts before ever sending a plan, so the server's read of it fails too;
+        // best-effort drain so the task does not dangle past the test.
+        try { await serverTask; } catch { /* the server may fault on the torn connection too */ }
     }
 
     [Fact]

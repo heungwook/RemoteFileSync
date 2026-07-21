@@ -333,7 +333,33 @@ public sealed class SyncClient
         // `skew` is the measured client-vs-server clock offset from the v3 handshake above.
         // Passing ClockSkew.None here would leave a peer with a fast clock winning every
         // newest-wins comparison forever, re-transferring the same bytes on every run.
-        IReadOnlyDictionary<string, AncestorRow>? ancestor = _db?.LoadAll();
+        IReadOnlyDictionary<string, AncestorRow>? ancestor;
+        try
+        {
+            ancestor = _db?.LoadAll();
+        }
+        catch (Exception ex) when (_dbPath != null && PairMarker.Exists(_dbPath))
+        {
+            // PairStateLost's header probe only proves the file opens as SQLite; it does not
+            // prove the `files` table inside it survived intact. A database whose header is
+            // fine but whose ancestor table was dropped or corrupted passes that probe and
+            // throws here instead — the same "prior state now unreadable" case the gate above
+            // exists to catch, just discovered one step later. The marker's presence is what
+            // proves a real prior sync happened, so this earns the identical exit 4 + restore
+            // guidance rather than surfacing as a generic crash. Without the marker check this
+            // filter would also swallow a genuine first run's exceptions and fabricate a "state
+            // lost" report for state that never existed — so an absent marker falls through
+            // uncaught, exactly like today, to the generic fatal-error path.
+            var msg = "Sync state lost: this pair has synced before (pair.marker is present) but " +
+                      $"its database at '{_dbPath}' could not be read ({ex.GetType().Name}: " +
+                      $"{ex.Message}). Without it, every file present on only one side is " +
+                      "indistinguishable from one the peer deleted. Restore the database from " +
+                      "backup, or re-run with --mirror to accept the destination being " +
+                      "overwritten to match the source.";
+            _logger.Error(msg);
+            _progress.WriteError(msg, fatal: true);
+            return 4;
+        }
         var planResult = SyncEngine.ComputePlan(
             clientManifest, serverManifest, _options.Mode, ancestor,
             _options.DeleteEnabled, _options.MirrorDeletes, skew);
@@ -639,28 +665,55 @@ public sealed class SyncClient
             foreach (var del in serverDeletes)
             {
                 if (!_stdinReader.WaitWhilePaused(ct)) { _logger.Warning("Stop requested."); stopped = true; break; }
-                var payload = ProtocolHandler.SerializeDeleteFile(del.RelativePath, backupFirst: true);
-                await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteFile, payload, ct);
-
-                var (confType, confData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
-                if (confType == MessageType.DeleteConfirm)
+                try
                 {
-                    var (_, success) = ProtocolHandler.DeserializeDeleteConfirm(confData);
-                    if (success)
+                    var payload = ProtocolHandler.SerializeDeleteFile(del.RelativePath, backupFirst: true);
+                    await ProtocolHandler.WriteMessageAsync(stream, MessageType.DeleteFile, payload, ct);
+
+                    var (confType, confData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+                    if (confType == MessageType.DeleteConfirm)
                     {
-                        filesDeleted++;
-                        _logger.Info($"[DEL→] {del.RelativePath} (deleted on server)");
-                        _progress.WriteDelete(del.RelativePath, backed_up: true, success: true);
-                        _db?.MarkDeleted(del.RelativePath, sessionId, "deleted on client, propagated to server");
-                    }
-                    else
-                    {
-                        _logger.Warning($"Server failed to delete {del.RelativePath}");
-                        _progress.WriteDelete(del.RelativePath, backed_up: false, success: false);
-                        skippedFiles++;
+                        var (_, success) = ProtocolHandler.DeserializeDeleteConfirm(confData);
+                        if (success)
+                        {
+                            filesDeleted++;
+                            _logger.Info($"[DEL→] {del.RelativePath} (deleted on server)");
+                            _progress.WriteDelete(del.RelativePath, backed_up: true, success: true);
+                            _db?.MarkDeleted(del.RelativePath, sessionId, "deleted on client, propagated to server");
+                        }
+                        else
+                        {
+                            _logger.Warning($"Server failed to delete {del.RelativePath}");
+                            _progress.WriteDelete(del.RelativePath, backed_up: false, success: false);
+                            skippedFiles++;
+                        }
                     }
                 }
+                catch (Exception ex) when (IsPeerDisconnect(ex))
+                {
+                    // Mirror of the Phase A catch above: an asymmetric --force-delete run (client
+                    // forced, server not) can reach this loop with the socket already closed —
+                    // the server hit its own delete budget, return-4'd and disposed its stream
+                    // before this write ever lands. Every later frame on this stream fails the
+                    // same way, so stop the phase here instead of throwing out of the delete
+                    // loop uncaught.
+                    _logger.Error($"Peer closed the connection while deleting {del.RelativePath} " +
+                                  $"on the server ({ex.GetType().Name}: {ex.Message}). The peer " +
+                                  "likely aborted after its own delete-budget guard rejected the " +
+                                  "plan; aborting.");
+                    desynced = true;
+                    break;
+                }
             }
+        }
+
+        if (desynced)
+        {
+            // Same terminal handling as the Phase A check above: a peer disconnect discovered
+            // during the delete phase leaves every later frame on this stream unusable too.
+            skippedFiles++;
+            _progress.WriteError("Protocol desync or peer disconnect during delete phase; aborting sync.", fatal: true);
+            return 3;   // inside the try — the finally still calls CompleteSession
         }
 
         // 9. Receive files from server (SendToClient + ServerOnly). Push never writes to the
@@ -847,9 +900,23 @@ public sealed class SyncClient
         sw.Stop();
         int exitCode = (skippedFiles > 0 || stopped) ? 1 : 0;
         _progress.WriteComplete(filesTransferred, filesDeleted, bytesTransferred, sw.ElapsedMilliseconds, exitCode);
-        var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, filesDeleted, sw.ElapsedMilliseconds);
-        await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
-        var (scType, scData) = await ProtocolHandler.ReadMessageAsync(stream, ct);
+        try
+        {
+            var completePayload = ProtocolHandler.SerializeSyncComplete(filesTransferred, bytesTransferred, filesDeleted, sw.ElapsedMilliseconds);
+            await ProtocolHandler.WriteMessageAsync(stream, MessageType.SyncComplete, completePayload, ct);
+            await ProtocolHandler.ReadMessageAsync(stream, ct);
+        }
+        catch (Exception ex) when (IsPeerDisconnect(ex))
+        {
+            // Same peer-disconnect handling as the transfer and delete phases: a socket the peer
+            // already closed (its own guard rejected the plan, or it aborted for any other
+            // reason) fails this closing exchange exactly like it would fail an earlier one, and
+            // deserves the same clean exit rather than an unhandled throw this late in the run.
+            _logger.Error($"Peer closed the connection during the closing SyncComplete exchange " +
+                          $"({ex.GetType().Name}: {ex.Message}). Aborting.");
+            _progress.WriteError("Protocol desync or peer disconnect during sync completion; aborting sync.", fatal: true);
+            return 3;   // inside the try — the finally still calls CompleteSession
+        }
         var deletedLabel = filesDeleted > 0 ? $", {filesDeleted} deleted" : "";
         _logger.Summary($"Sync complete: {filesTransferred} files transferred{deletedLabel}, {bytesTransferred / (1024.0 * 1024.0):F1} MB, {sw.ElapsedMilliseconds}ms");
 

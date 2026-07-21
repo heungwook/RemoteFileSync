@@ -74,6 +74,51 @@ public class SyncLoggerTests : IDisposable
     }
 
     [Fact]
+    public void LogAfterDispose_DoesNotThrow()
+    {
+        // _logWriter is readonly and cannot be nulled on Dispose, so a naive fix would leave
+        // Log() calling WriteLine on a disposed StreamWriter. The Ctrl+C handler's shutdown
+        // Warning is a real caller that can land after Dispose.
+        var logPath = Path.Combine(Path.GetTempPath(), $"synclogger_test_{Guid.NewGuid()}.log");
+        try
+        {
+            var logger = new SyncLogger(verbose: false, logFile: logPath);
+            logger.Info("before dispose");
+            logger.Dispose();
+
+            var ex = Record.Exception(() =>
+            {
+                logger.Warning("after dispose");
+                logger.Info("also after dispose");
+            });
+            Assert.Null(ex);
+        }
+        finally
+        {
+            if (File.Exists(logPath)) File.Delete(logPath);
+        }
+    }
+
+    [Fact]
+    public void DoubleDispose_DoesNotThrow()
+    {
+        var logPath = Path.Combine(Path.GetTempPath(), $"synclogger_test_{Guid.NewGuid()}.log");
+        try
+        {
+            var logger = new SyncLogger(verbose: false, logFile: logPath);
+            logger.Info("some line");
+            logger.Dispose();
+
+            var ex = Record.Exception(logger.Dispose);
+            Assert.Null(ex);
+        }
+        finally
+        {
+            if (File.Exists(logPath)) File.Delete(logPath);
+        }
+    }
+
+    [Fact]
     public void LogFile_WritesAllLevels()
     {
         var logPath = Path.Combine(Path.GetTempPath(), $"synclogger_test_{Guid.NewGuid()}.log");
